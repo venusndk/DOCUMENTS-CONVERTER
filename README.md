@@ -5,11 +5,31 @@ runs OCR + table detection on it, and exports the extracted table(s) to an
 Excel (`.xlsx`) file — built and hardened specifically for dense, multi-page
 grade/mark-sheet style tables.
 
+## Project layout
+
+```
+scan_to_excel.py                     thin CLI wrapper (unchanged usage)
+documents_converter/
+    __init__.py
+    ocr_excel.py                     the actual implementation
+tests/
+    conftest.py
+    test_ocr_excel.py                 regression tests, see "Running tests" below
+    fixtures/synthetic_scan.py        generates a fabricated (no real data) test PDF
+docs/
+    PHASE_0_AUDIT.md                  current-state audit, capability matrix, phase plan
+```
+
+`documents_converter/ocr_excel.py` holds all the actual logic; `scan_to_excel.py`
+is kept at the repo root as a thin wrapper so existing usage
+(`python scan_to_excel.py ...`) keeps working unchanged.
+
 ## Setup (Windows)
 
 1. Install Python packages:
    ```powershell
    pip install -r requirements.txt
+   # add -r requirements-dev.txt too if you want to run the test suite
    ```
 
 2. Install the Tesseract OCR engine (not a Python package — a separate binary):
@@ -44,6 +64,22 @@ there defaults to **on** except `--dpi`, `--auto-rotate`, and `--preprocess`
 you've confirmed on your own document that the override actually helps
 (see the DPI/preprocess note below, both of which measured *worse* than
 the default on the real document this was tuned against).
+
+## Running tests
+
+```powershell
+pip install -r requirements-dev.txt
+pytest tests/ -v
+```
+
+Tests run against a synthetic, fabricated fixture generated on the fly
+(`tests/fixtures/synthetic_scan.py`) — never real scanned documents, which
+contain genuine personal data (see the Accuracy & trust report below and
+`docs/PHASE_0_AUDIT.md` risk register). Each test's docstring names the
+specific real bug it guards against — these aren't speculative edge cases,
+they're regressions this project actually hit during development. One
+end-to-end test needs a real Tesseract install and skips automatically if
+it can't find one on `PATH` or at the default Windows install location.
 
 ---
 

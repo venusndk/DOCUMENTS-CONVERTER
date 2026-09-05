@@ -1,6 +1,19 @@
-img2table
-pytesseract
-openpyxl
-pdf2image
-PyMuPDF
-pillow
+# Pinned to the exact versions this project was built and tested against
+# (docs/PHASE_0_AUDIT.md Dependency Map). Three of these are load-bearing
+# for deliberate monkeypatches in documents_converter/ocr_excel.py that
+# depend on their current internal structure -- treat any upgrade as a
+# deliberate, tested change, not a routine `pip install --upgrade`.
+img2table==2.0.0
+pytesseract==0.3.13
+openpyxl==3.1.5
+pdf2image==1.17.0
+PyMuPDF==1.27.2.3
+pillow==11.3.0
+
+# Transitive dependencies of img2table, pinned explicitly because the code
+# depends directly on their behavior (not just img2table's public API):
+xlsxwriter==3.2.9      # monkeypatched directly (Workbook.__init__)
+numpy==2.3.5
+opencv-contrib-python==5.0.0.93
+pypdfium2==5.13.0
+beautifulsoup4==4.9.3
