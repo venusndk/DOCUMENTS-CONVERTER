@@ -22,3 +22,13 @@ MAX_UPLOAD_MB: int = int(os.environ.get("MAX_UPLOAD_MB", "50"))
 ALLOWED_EXTENSIONS: frozenset[str] = frozenset(
     {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
 )
+
+# Phase 4 (docs/PHASE_0_AUDIT.md): security hardening.
+RATE_LIMIT_MAX_REQUESTS: int = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "10"))
+RATE_LIMIT_WINDOW_SECONDS: float = float(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
+# Best-effort wall-clock cap per conversion. "Best-effort" because a
+# ThreadPoolExecutor future can be abandoned on timeout but the underlying
+# OS thread isn't forcibly killed (Python has no safe API for that) -- see
+# app.py. Real documents in this project's own testing took well under a
+# minute; generous enough to allow that with margin for a slow machine.
+CONVERT_TIMEOUT_SECONDS: float = float(os.environ.get("CONVERT_TIMEOUT_SECONDS", "180"))

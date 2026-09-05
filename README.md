@@ -110,7 +110,38 @@ curl.exe -F "file=@transcript.pdf" http://127.0.0.1:8000/api/v1/convert -o resul
 
 Configuration (environment variables, see `documents_converter/api/config.py`):
 `TESSERACT_CMD` (default: none, i.e. must be on `PATH`), `MAX_UPLOAD_MB`
-(default: 50).
+(default: 50), `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS`
+(default: 10 requests per 60s per client IP), `CONVERT_TIMEOUT_SECONDS`
+(default: 180).
+
+### Security hardening
+
+Beyond Phase 3's basic hygiene (extension allowlist, safe temp-file
+naming, no document-content logging), the API also has:
+
+- **Magic-byte validation** — the file's actual content must match a
+  known signature for the extension it claims (`documents_converter/api/security.py`).
+  A `.pdf` that isn't really a PDF is rejected before any processing.
+- **Decompression-bomb limits** — a PDF's page count and an image's
+  decompressed pixel dimensions are checked (200 pages / 50 megapixels by
+  default) *before* the expensive OCR pipeline runs, since a small file
+  can still decompress into something that exhausts memory.
+- **Per-IP rate limiting** — a simple in-memory fixed-window limiter
+  (`documents_converter/api/rate_limit.py`). Deliberately not backed by
+  Redis: correct for the single-process deployment this project currently
+  is, but it won't share state across multiple replicas — a real
+  multi-instance deployment needs a shared store instead.
+- **Best-effort conversion timeout** — a hung or pathological file won't
+  hold a request open forever. "Best-effort" because Python has no safe
+  API to force-kill a thread; an abandoned conversion keeps running in
+  the background until it finishes, it's just no longer waited on.
+- **No leaked stack traces** — a catch-all exception handler guarantees
+  any unexpected error returns a generic message, regardless of what
+  actually went wrong.
+
+Still explicitly out of scope (see `docs/PHASE_0_AUDIT.md` Phase Plan):
+authentication, and the rate limiter's single-process limitation above.
+Not yet suitable for untrusted public traffic without those.
 
 ## Running tests
 
