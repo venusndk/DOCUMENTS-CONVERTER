@@ -23,6 +23,15 @@ ALLOWED_EXTENSIONS: frozenset[str] = frozenset(
     {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
 )
 
+# Phase 6 (docs/PHASE_0_AUDIT.md): API-key auth. Comma-separated list of
+# accepted keys. Empty by default -- auth is OFF until at least one key is
+# configured, a deliberate choice (not a silent bypass) so a fresh local
+# dev setup keeps working with zero extra configuration. Set this before
+# exposing the API to anything other than trusted local use.
+API_KEYS: tuple[str, ...] = tuple(
+    k.strip() for k in os.environ.get("API_KEYS", "").split(",") if k.strip()
+)
+
 # Phase 4 (docs/PHASE_0_AUDIT.md): security hardening.
 RATE_LIMIT_MAX_REQUESTS: int = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "10"))
 RATE_LIMIT_WINDOW_SECONDS: float = float(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
