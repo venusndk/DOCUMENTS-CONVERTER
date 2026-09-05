@@ -17,6 +17,8 @@ import openpyxl
 import pytest
 
 from documents_converter import ocr_excel as ste
+from documents_converter.providers.cell_ocr import TesseractCellOCR
+from documents_converter.providers.table_detection import _pick_extraction_mode
 
 from conftest import requires_tesseract
 
@@ -156,3 +158,61 @@ def test_convert_scanned_to_excel_end_to_end(tmp_path, synthetic_pdf, tesseract_
 
     student2 = rows[3][:9]
     assert student2 == ("2", "100000002", "DOE", "JANE", "F", "70,00", "65,00", "135", "67,50")
+
+
+# --------------------------------------------------------------------------
+# Phase 2: provider-level tests (docs/PHASE_0_AUDIT.md). Added when the
+# per-cell OCR call and the table-detection strategy were pulled out behind
+# CellOCRProvider / TableDetector so they're independently testable, rather
+# than only reachable through the full end-to-end pipeline.
+# --------------------------------------------------------------------------
+
+
+@requires_tesseract
+def test_tesseract_cell_ocr_recognizes_a_known_crop(synthetic_pdf, tesseract_cmd):
+    """The provider that _fix_rotated_cells and the grid-fallback both use for
+    per-cell OCR, exercised directly rather than only via the full pipeline."""
+    import pytesseract
+
+    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+    gray = _render_gray(synthetic_pdf)
+    row_lines, col_lines = ste._detect_grid_lines(gray)
+    # Row 1 (index 1, after the header) / column 2 (Surname) is "SMITH" in
+    # the fixture -- see tests/fixtures/synthetic_scan.py.
+    y1, y2 = row_lines[1], row_lines[2]
+    x1, x2 = col_lines[2], col_lines[3]
+    crop = gray[y1 + 3 : y2 - 3, x1 + 3 : x2 - 3]
+
+    assert TesseractCellOCR().recognize(crop) == "SMITH"
+
+
+def test_pick_extraction_mode_prefers_bordered_for_a_clean_grid(synthetic_pdf):
+    """The fixture has a fully ruled grid, so the cheap shape-only comparison
+    should prefer the stricter bordered detector over borderless."""
+    gray_rgb = fitz.open(str(synthetic_pdf))[0].get_pixmap(matrix=fitz.Matrix(200 / 72, 200 / 72))
+    img = np.frombuffer(gray_rgb.samples, dtype=np.uint8).reshape(
+        gray_rgb.height, gray_rgb.width, gray_rgb.n
+    )[:, :, :3]
+    assert _pick_extraction_mode(img) is False
+
+
+@requires_tesseract
+def test_progress_callback_used_instead_of_print(tmp_path, synthetic_pdf, tesseract_cmd):
+    """
+    Regression guard for the Phase 2 progress-callback addition: a caller
+    should be able to capture pipeline status without scraping stdout (the
+    motivating case is a future job-queue/API layer logging structured
+    progress rather than print()). Passing a custom callback must not change
+    the pipeline's actual output.
+    """
+    messages = []
+    out_path = tmp_path / "out.xlsx"
+    ste.convert_scanned_to_excel(
+        file_path=str(synthetic_pdf),
+        output_excel_path=str(out_path),
+        tesseract_cmd=tesseract_cmd,
+        progress=messages.append,
+    )
+    assert any("Detected file type" in m for m in messages)
+    assert any("Done." in m for m in messages)
+    assert out_path.exists()

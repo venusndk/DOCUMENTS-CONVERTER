@@ -11,7 +11,16 @@ grade/mark-sheet style tables.
 scan_to_excel.py                     thin CLI wrapper (unchanged usage)
 documents_converter/
     __init__.py
-    ocr_excel.py                     the actual implementation
+    ocr_excel.py                     pipeline orchestration (file-type detection,
+                                      calling the providers below in order, writing
+                                      the .xlsx, the Excel/img2table bugfix patches)
+    providers/
+        cell_ocr.py                  CellOCRProvider: recognizes text in one
+                                      already-cropped cell image (used by the
+                                      rotated-header fix and the grid fallback)
+        table_detection.py           TableDetector: per-page bordered/borderless
+                                      mode selection, img2table extraction, and
+                                      the grid-line-detection fallback
 tests/
     conftest.py
     test_ocr_excel.py                 regression tests, see "Running tests" below
@@ -20,9 +29,11 @@ docs/
     PHASE_0_AUDIT.md                  current-state audit, capability matrix, phase plan
 ```
 
-`documents_converter/ocr_excel.py` holds all the actual logic; `scan_to_excel.py`
-is kept at the repo root as a thin wrapper so existing usage
-(`python scan_to_excel.py ...`) keeps working unchanged.
+`documents_converter/ocr_excel.py` orchestrates the pipeline and calls into
+`providers/` for the two things most likely to need a different engine some
+day (per-cell OCR, table detection); `scan_to_excel.py` is kept at the repo
+root as a thin wrapper so existing usage (`python scan_to_excel.py ...`)
+keeps working unchanged.
 
 ## Setup (Windows)
 
