@@ -1,0 +1,39 @@
+name: Tests
+
+# Runs the full test suite on every push/PR to main -- see
+# docs/PHASE_0_AUDIT.md Phase 5: nothing was catching a regression
+# automatically before this, despite Phases 1-4 building real test
+# coverage specifically to guard against real bugs found in this project.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies (Tesseract OCR)
+        # opencv-contrib-python needs libGL/libglib even headless on a
+        # minimal Linux image -- a common gotcha on CI runners, not
+        # optional here.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            tesseract-ocr libgl1 libglib2.0-0
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-api.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest tests/ -v

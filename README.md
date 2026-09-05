@@ -24,6 +24,8 @@ documents_converter/
     api/
         app.py                       minimal synchronous HTTP API (see below)
         config.py                    environment-based API configuration
+        security.py                  magic-byte + decompression-bomb checks
+        rate_limit.py                per-IP fixed-window rate limiter
 tests/
     conftest.py
     test_ocr_excel.py                 pipeline/provider regression tests
@@ -31,6 +33,8 @@ tests/
     fixtures/synthetic_scan.py        generates a fabricated (no real data) test PDF
 docs/
     PHASE_0_AUDIT.md                  current-state audit, capability matrix, phase plan
+.github/workflows/test.yml            CI: runs the test suite on every push/PR
+Dockerfile                            containerizes the API (not the CLI)
 ```
 
 `documents_converter/ocr_excel.py` orchestrates the pipeline and calls into
@@ -142,6 +146,31 @@ naming, no document-content logging), the API also has:
 Still explicitly out of scope (see `docs/PHASE_0_AUDIT.md` Phase Plan):
 authentication, and the rate limiter's single-process limitation above.
 Not yet suitable for untrusted public traffic without those.
+
+### Running the API in Docker
+
+```powershell
+docker build -t documents-converter-api .
+docker run -p 8000:8000 documents-converter-api
+```
+
+Tesseract is installed inside the image (`apt-get install tesseract-ocr`),
+so no `TESSERACT_CMD` is needed there. Verified locally: built the image,
+ran it, and confirmed a real conversion through the container produces the
+same correct data as running natively — worth knowing if you compare
+outputs closely, the *blank*-cell noise can differ slightly page to page,
+since the Linux `apt` Tesseract build reads faint empty-cell artifacts a
+little differently than the Windows build used elsewhere in this project;
+that's cosmetic, not a correctness issue (see the Accuracy & trust report
+below on this class of noise generally).
+
+## Continuous integration
+
+`.github/workflows/test.yml` runs the full test suite on every push and
+pull request to `main` — added specifically because nothing was catching
+a regression automatically before this, despite the real test coverage
+Phases 1-4 built to guard against real bugs found during this project's
+development.
 
 ## Running tests
 
