@@ -1,0 +1,12 @@
+.git
+.github
+__pycache__
+*.pyc
+.pytest_cache
+.claude
+tests/
+docs/
+*.pdf
+*.xlsx
+*.md
+requirements-dev.txt
