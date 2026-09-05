@@ -1,0 +1,6 @@
+img2table
+pytesseract
+openpyxl
+pdf2image
+PyMuPDF
+pillow

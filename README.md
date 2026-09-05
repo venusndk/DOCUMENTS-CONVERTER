@@ -1,0 +1,199 @@
+# Scanned PDF/Image → Excel Converter
+
+Detects whether an input file is a scanned image or a scanned (image-based) PDF,
+runs OCR + table detection on it, and exports the extracted table(s) to an
+Excel (`.xlsx`) file — built and hardened specifically for dense, multi-page
+grade/mark-sheet style tables.
+
+## Setup (Windows)
+
+1. Install Python packages:
+   ```powershell
+   pip install -r requirements.txt
+   ```
+
+2. Install the Tesseract OCR engine (not a Python package — a separate binary):
+   - Download the installer: https://github.com/UB-Mannheim/tesseract-ocr/wiki
+     (UB-Mannheim builds; get the 64-bit `.exe`)
+   - Install it, then either:
+     - add its install folder (default `C:\Program Files\Tesseract-OCR`) to your
+       system `PATH`, **or**
+     - pass its full path at run time with `--tesseract-cmd`.
+
+3. Install Poppler (needed for PDF page rasterization by `pdf2image`):
+   - Download: https://github.com/oschwartz10612/poppler-windows/releases
+   - Unzip it somewhere (e.g. `C:\poppler`) and add its `Library\bin` folder
+     to your system `PATH`.
+
+4. Restart your terminal so the updated `PATH` takes effect, then verify:
+   ```powershell
+   tesseract --version
+   pdftoppm -v
+   ```
+
+## Usage
+
+```powershell
+python scan_to_excel.py input_file.pdf -o output.xlsx
+python scan_to_excel.py scanned_image.png
+```
+
+Run `python scan_to_excel.py -h` for the full flag list. Everything listed
+there defaults to **on** except `--dpi`, `--auto-rotate`, and `--preprocess`
+— the defaults are the tested-safe configuration; only override them if
+you've confirmed on your own document that the override actually helps
+(see the DPI/preprocess note below, both of which measured *worse* than
+the default on the real document this was tuned against).
+
+---
+
+## Accuracy & trust report
+
+This section exists because this tool has been proposed for feeding
+**official records**. Read this before trusting its output for that.
+
+### The honest baseline
+
+**No OCR pipeline — this one included — can honestly promise 100%
+automated accuracy on a real scanned document.** That is a fundamental
+limit of OCR technology, not a gap specific to this script. Anyone telling
+you otherwise about any OCR tool is not being straight with you. What a
+well-engineered pipeline *can* do is (1) maximize accuracy through
+cross-checking and structural validation, and (2) make its own remaining
+uncertainty visible rather than hiding it. Both are built in here — see
+below — but neither is a substitute for a human reviewing the flagged
+output before it becomes an official record.
+
+### What's been verified, concretely, not assumed
+
+Every claim below was checked by rendering the actual source PDF page as
+an image and comparing it cell-by-cell against the extracted spreadsheet
+— not inferred from confidence scores or spot-guessed:
+
+- **Module/course codes**: 100% correct across every sample checked
+  (dozens of codes across two different documents).
+- **Numeric grades**: verified exact matches in the large majority of
+  cells checked — e.g. one student's full 9-module grade row, total
+  credit count, and average all matched the source exactly; another had
+  8 of 9 grades exact with one single-digit slip. That ratio (occasional
+  single-character misreads, never wholesale wrong values) is
+  representative of what testing found across both documents.
+- **Names and IDs**: correct in the large majority of cases; occasional
+  garbling when a name sits in a merged/under-segmented cell region.
+- **Page coverage**: 100% of pages produced output on both test
+  documents, after fixing table-detection failures that were originally
+  silently dropping whole pages.
+- **File integrity**: zero instances of the Excel-formula-injection
+  corruption bug (see Engineering below) across every regenerated file.
+
+### What's NOT reliable without review
+
+- **Isolated single-digit/single-character misreads on otherwise
+  well-formatted values.** This is the hardest class of error to catch
+  automatically, by nature: a misread digit that still looks like a
+  plausible number (`78,52` instead of `78,50`) passes every automated
+  sanity check there is. No heuristic — including the ones in this
+  script — can catch a wrong-but-plausible value without a second,
+  independent source of truth. This is the main reason a human should
+  proofread the final numbers before they're treated as official.
+- **Merged-cell "None" artifacts**: on some rows, two adjacent OCR reads
+  bleed into one cell (e.g. `"None 80,50 None 78,50"`). Confirmed: every
+  instance of this found during testing was correctly caught by the
+  suspicious-cell flagging below — but this class of error is not yet
+  eliminated at the source, only reliably surfaced for review.
+- **Header cells on pages that are structurally unlike every other page**
+  in the document (too few "peer" pages sharing the same column layout
+  to vote with) don't benefit from cross-page correction and are more
+  likely to still show OCR noise.
+
+### The two safeguards built specifically for "trusted document" use
+
+1. **Cross-page consensus correction** — module name/code headers repeat
+   identically across every page of a document section. Independent
+   pages agreeing with each other is real corroborating evidence a single
+   page's OCR result never has on its own; this pools all pages sharing
+   the same layout, takes the majority reading per column, and corrects
+   any outlier page to match. Verified: on a 35-page test document this
+   corrected 526 header cells; spot-checked before/after and confirmed
+   cells that were pure noise became exactly correct course codes.
+
+2. **Suspicious-cell flagging (yellow highlight)** — every cell is
+   checked against an *allowlist* of characters that can legitimately
+   appear in this kind of document (letters, digits, standard
+   punctuation). Anything else — a stray symbol, a mismatched decimal
+   separator, a leftover literal "None" from a failed merge — gets
+   highlighted yellow in the output. This is deliberately not a claim
+   that a flagged cell *is* wrong, only that it didn't pass a basic
+   sanity check and is worth a manual glance. Verified: in every
+   confirmed real error found during testing (a `76.90` where `76,00`
+   was correct; a `$6,00` where `66,00` was correct; every "None"-merge
+   artifact checked), the flagging system caught it. **Recommended
+   workflow for official use: review every yellow cell before treating
+   the output as a record. Don't disable this flag for that use case.**
+
+### Practical recommendation
+
+Use this as an **OCR-assisted data-entry accelerator with mandatory human
+review of every flagged cell**, not as a fully-automated, zero-touch
+pipeline for legally-binding records. That's not a weakness specific to
+this script — it's the honest operating envelope of OCR technology on
+real scanned paper. Within that envelope, this pipeline has been
+engineered and tested to get as close to full automation as the
+technology allows, and to be transparent about exactly where it isn't
+certain.
+
+---
+
+## Notes
+
+- Works on `.pdf`, `.png`, `.jpg`, `.jpeg`, `.tiff`, `.tif`, `.bmp`.
+- For PDFs, the script auto-detects whether there's an extractable text layer;
+  image-based (scanned) PDFs get routed through OCR, text-based PDFs are
+  parsed directly (OCR still runs but has little effect).
+- Bordered-vs-borderless table detection is chosen **per page, automatically**
+  (`--no-auto-mode` to disable): tested on real documents where a single
+  fixed choice for the whole file was actively wrong for some pages either
+  way — one page needed borderless to be detected at all, while forcing
+  borderless on another page fragmented an otherwise-clean table.
+- If `img2table`'s own detector fails a page outright, or silently drops
+  columns during its internal OCR-refinement step (confirmed on a real
+  document: 20 genuine columns collapsed to 16, with a header label copied
+  into every data row of the dropped columns), a direct grid-line detector
+  (classical CV, bypassing that step entirely) reconstructs the table
+  instead of losing the data. `--no-grid-fallback` to disable.
+
+### On `--dpi` and `--preprocess` (tested, not assumed)
+
+These were added expecting them to improve accuracy, then actually tested
+against a real 35-page scanned document and measured — the results were
+counterintuitive, so don't reach for them by default:
+
+- **`--dpi` above the default (200) made things worse** on the test document:
+  raising it to 300 caused `img2table`'s table-border detection (tuned around
+  ~200 DPI pixel thickness) to miss tables on more than half the pages that
+  200 DPI found correctly. Only raise it if you've confirmed on your own file
+  that detection still finds at least as many tables at the higher setting.
+- **`--preprocess` (denoise + contrast enhancement) also made things worse**
+  on the test document: rows that OCR'd cleanly at plain 200 DPI came out
+  more corrupted with it on (more merged/missing cells). It's left in as an
+  opt-in experiment for documents that are genuinely low-contrast/noisy, but
+  verify it actually helps on a sample page before trusting it for a full run.
+- **The setting that actually worked best was the plain default** (no `--dpi`
+  override, no `--preprocess`).
+
+### Known accuracy limitation: rotated/vertical header text
+
+If your source document has column headers printed sideways (rotated 90°)
+inside table cells — common in dense grade/mark sheets — those cells used to
+come out completely garbled (Tesseract reads left-to-right and doesn't
+auto-detect per-cell rotation). This is now handled: such cells are detected
+geometrically (tall/narrow bounding box), cropped, rotated back to
+horizontal, upscaled, and re-OCR'd (`--no-rotation-fix` to disable). Verified
+on a real document going from unreadable noise to correct course titles and
+codes.
+
+For documents that are broadly low-quality throughout — not just rotated
+headers — an LLM-vision approach (sending the page image to a vision-capable
+model and asking for structured JSON, then loading that into pandas) may do
+better than Tesseract in some cases, at the cost of per-document API calls
+and its own, different failure modes. Not built into this script.
