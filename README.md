@@ -21,9 +21,13 @@ documents_converter/
         table_detection.py           TableDetector: per-page bordered/borderless
                                       mode selection, img2table extraction, and
                                       the grid-line-detection fallback
+    api/
+        app.py                       minimal synchronous HTTP API (see below)
+        config.py                    environment-based API configuration
 tests/
     conftest.py
-    test_ocr_excel.py                 regression tests, see "Running tests" below
+    test_ocr_excel.py                 pipeline/provider regression tests
+    test_api.py                        API tests
     fixtures/synthetic_scan.py        generates a fabricated (no real data) test PDF
 docs/
     PHASE_0_AUDIT.md                  current-state audit, capability matrix, phase plan
@@ -76,12 +80,47 @@ you've confirmed on your own document that the override actually helps
 (see the DPI/preprocess note below, both of which measured *worse* than
 the default on the real document this was tuned against).
 
+## HTTP API (optional)
+
+A minimal synchronous API wraps the same engine, for anything that needs
+to call this over HTTP instead of the CLI. It is deliberately **not** a
+job queue: the request stays open until the conversion finishes, since
+that's the right amount of infrastructure for a first API (see
+`docs/PHASE_0_AUDIT.md` Phase 3) — a queue only earns its complexity once
+real usage shows requests taking long enough to need one.
+
+```powershell
+pip install -r requirements.txt -r requirements-api.txt
+
+# TESSERACT_CMD only needed if tesseract isn't already on PATH
+$env:TESSERACT_CMD = "C:\Program Files\Tesseract-OCR\tesseract.exe"
+uvicorn documents_converter.api.app:app --reload
+```
+
+```
+GET  /health            -> {"status": "ok", "tesseract_available": true}
+POST /api/v1/convert    -> upload a file (multipart/form-data, field name
+                            "file"), get the .xlsx back in the response body
+```
+
+Example:
+```powershell
+curl.exe -F "file=@transcript.pdf" http://127.0.0.1:8000/api/v1/convert -o result.xlsx
+```
+
+Configuration (environment variables, see `documents_converter/api/config.py`):
+`TESSERACT_CMD` (default: none, i.e. must be on `PATH`), `MAX_UPLOAD_MB`
+(default: 50).
+
 ## Running tests
 
 ```powershell
-pip install -r requirements-dev.txt
+pip install -r requirements.txt -r requirements-api.txt -r requirements-dev.txt
 pytest tests/ -v
 ```
+
+(`requirements-api.txt` is needed too since `tests/test_api.py` imports the
+API app.)
 
 Tests run against a synthetic, fabricated fixture generated on the fly
 (`tests/fixtures/synthetic_scan.py`) — never real scanned documents, which
