@@ -229,3 +229,114 @@ def test_health_never_requires_auth(monkeypatch):
     monkeypatch.setattr(config, "API_KEYS", ("secret-key-1",))
     resp = client.get("/health")
     assert resp.status_code == 200
+
+
+# --------------------------------------------------------------------------
+# Phase 7: async job queue (docs/PHASE_0_AUDIT.md).
+# --------------------------------------------------------------------------
+
+
+def test_create_job_validates_upload_before_queueing():
+    """Bad input is rejected immediately with the normal validation error,
+    not accepted into the queue only to be discovered as 'failed' later by
+    polling."""
+    resp = client.post("/api/v1/jobs", files=_junk_file)
+    assert resp.status_code == 400
+    assert "Unsupported file type" in resp.json()["detail"]
+
+
+def test_create_job_requires_auth_when_configured(monkeypatch):
+    monkeypatch.setattr(config, "API_KEYS", ("secret-key-1",))
+    resp = client.post("/api/v1/jobs", files=_junk_file)
+    assert resp.status_code == 401
+
+
+def test_job_status_and_result_endpoints_require_auth_when_configured(monkeypatch):
+    """Checked with a made-up job id specifically to prove auth is
+    enforced before the job lookup happens (401, not 404)."""
+    monkeypatch.setattr(config, "API_KEYS", ("secret-key-1",))
+    assert client.get("/api/v1/jobs/does-not-exist").status_code == 401
+    assert client.get("/api/v1/jobs/does-not-exist/result").status_code == 401
+
+
+def test_get_job_status_404_for_unknown_id():
+    resp = client.get("/api/v1/jobs/no-such-job-id")
+    assert resp.status_code == 404
+
+
+@requires_tesseract
+def test_create_job_returns_202_with_a_pollable_status(synthetic_pdf, tesseract_cmd, monkeypatch):
+    monkeypatch.setattr(config, "TESSERACT_CMD", tesseract_cmd)
+    with open(synthetic_pdf, "rb") as f:
+        resp = client.post(
+            "/api/v1/jobs", files={"file": ("synthetic_scan.pdf", f, "application/pdf")}
+        )
+    assert resp.status_code == 202
+    body = resp.json()
+    assert "job_id" in body
+    # Racy by nature (the background thread may already have picked it up
+    # by the time this response was built) -- both are valid, "completed"
+    # this early would not be.
+    assert body["status"] in ("queued", "processing")
+
+
+@requires_tesseract
+def test_job_lifecycle_completes_with_correct_result(synthetic_pdf, tesseract_cmd, monkeypatch):
+    """Full async round trip: submit, poll until done, download the
+    result, and check it against the same expected values already locked
+    in by the synchronous end-to-end test."""
+    import time
+
+    monkeypatch.setattr(config, "TESSERACT_CMD", tesseract_cmd)
+    with open(synthetic_pdf, "rb") as f:
+        resp = client.post(
+            "/api/v1/jobs", files={"file": ("synthetic_scan.pdf", f, "application/pdf")}
+        )
+    job_id = resp.json()["job_id"]
+
+    deadline = time.monotonic() + 60
+    status = None
+    while time.monotonic() < deadline:
+        status_resp = client.get(f"/api/v1/jobs/{job_id}")
+        assert status_resp.status_code == 200
+        status = status_resp.json()["status"]
+        if status in ("completed", "failed"):
+            break
+        time.sleep(0.5)
+
+    assert status == "completed", f"job did not complete in time (last status: {status})"
+
+    result_resp = client.get(f"/api/v1/jobs/{job_id}/result")
+    assert result_resp.status_code == 200
+    assert result_resp.headers["content-type"] == (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    wb = openpyxl.load_workbook(io.BytesIO(result_resp.content))
+    ws = wb[wb.sheetnames[0]]
+    rows = list(ws.iter_rows(values_only=True))
+    assert rows[1][:5] == ("1", "100000001", "SMITH", "JOHN", "M")
+
+
+@requires_tesseract
+def test_get_job_result_409_before_job_completes(synthetic_pdf, tesseract_cmd, monkeypatch):
+    """A job that's still running must report 409 (not ready), not the
+    file -- checked deterministically with a monkeypatched slow
+    conversion rather than racing a real one."""
+    import time
+
+    monkeypatch.setattr(config, "TESSERACT_CMD", tesseract_cmd)
+
+    def _slow_convert(*args, **kwargs):
+        time.sleep(5)
+
+    monkeypatch.setattr("documents_converter.api.app.convert_scanned_to_excel", _slow_convert)
+
+    with open(synthetic_pdf, "rb") as f:
+        resp = client.post(
+            "/api/v1/jobs", files={"file": ("synthetic_scan.pdf", f, "application/pdf")}
+        )
+    job_id = resp.json()["job_id"]
+
+    result_resp = client.get(f"/api/v1/jobs/{job_id}/result")
+    assert result_resp.status_code == 409
