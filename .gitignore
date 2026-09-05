@@ -1,0 +1,26 @@
+# Real scanned documents and generated output are NEVER committed.
+# test.pdf/test.xlsx used during development contain genuine students'
+# names, ID numbers, and grades (University of Rwanda transcripts) --
+# this is personal academic data and must not reach a GitHub repo,
+# public or private. If you need fixtures for tests, use synthetic
+# data with fabricated names/numbers, not real scans.
+*.pdf
+*.xlsx
+*.xls
+!fixtures/**/*.pdf
+!fixtures/**/*.xlsx
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local Claude Code session state, not project code
+.claude/
