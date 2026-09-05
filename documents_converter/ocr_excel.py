@@ -41,18 +41,15 @@ import re
 import sys
 import argparse
 import shutil
-from collections import Counter, OrderedDict, defaultdict
-from dataclasses import dataclass
+from collections import Counter, defaultdict
+from typing import Callable
 
 try:
-    import numpy as np
     import cv2
     import xlsxwriter
-    from img2table.document import Image, PDF
+    from img2table.document import Image
     from img2table.ocr import TesseractOCR
     from img2table.ocr._types import OCRData
-    from img2table.tables.extraction import BBox, ExtractedTable, TableCell
-    from img2table.tables.extractor import TableExtractor
     import pytesseract
 except ImportError:
     print("Missing dependency. Install with:\n"
@@ -118,80 +115,34 @@ def _patched_group_words_by_parent(words):
 OCRData._group_words_by_parent = staticmethod(_patched_group_words_by_parent)
 
 try:
-    import fitz  # PyMuPDF - used to check text layer, and for high-DPI page rendering
+    import fitz  # PyMuPDF - used to check text layer
 except ImportError:
     fitz = None
 
+# Phase 2 (docs/PHASE_0_AUDIT.md): table detection now lives in its own
+# provider module. Re-imported here (rather than only referenced via
+# `providers.table_detection.X`) so existing code below, and this
+# project's own test suite, keep working against `ocr_excel.<name>`
+# unchanged. The four re-exported below aren't called directly in this
+# file anymore (HighResPDF and TableDetector are) -- that's intentional,
+# not dead code, hence the noqa.
+from .providers.cell_ocr import CellOCRProvider, TesseractCellOCR
+from .providers.table_detection import (
+    HighResPDF,
+    TableDetector,
+    _detect_grid_lines,  # noqa: F401
+    _manual_grid_table,  # noqa: F401
+    _pick_extraction_mode,  # noqa: F401
+    _preprocess_image,  # noqa: F401
+)
 
-# img2table's own PDF class rasterizes pages at a fixed ~200 DPI (scale=200/72),
-# which is too low for dense/small print and is a major source of OCR errors on
-# real-world scans. HighResPDF overrides page rendering to use PyMuPDF directly
-# at a configurable DPI (default 300), with optional light preprocessing, while
-# reusing all of img2table's table-detection/extraction/xlsx-writing logic as-is.
-@dataclass
-class HighResPDF(PDF):
-    # NOTE: img2table's own table-border/line detection is tuned around its
-    # built-in ~200 DPI rendering. Raising this substantially (e.g. 300+) can
-    # make grid lines "too thick" in pixel terms and cause table detection to
-    # miss pages entirely -- verified on real documents where 300 DPI found
-    # tables on fewer pages than 200 DPI did. 200 is the safe default; only
-    # raise it if you've confirmed on your own document that detection still
-    # finds the same (or more) tables at the higher setting.
-    dpi: int = 200
-    preprocess: bool = False
-
-    @property
-    def images(self):
-        if self._images is None:
-            if fitz is None:
-                raise RuntimeError("PyMuPDF (fitz) is required for high-DPI PDF rendering.")
-
-            self._ensure_pages()
-            assert self.pages is not None
-
-            doc = fitz.open(stream=self.file_bytes, filetype="pdf")
-            zoom = self.dpi / 72
-            matrix = fitz.Matrix(zoom, zoom)
-
-            images = []
-            try:
-                for page_number in self.pages:
-                    pix = doc[page_number].get_pixmap(matrix=matrix, colorspace=fitz.csRGB)
-                    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-                        pix.height, pix.width, pix.n
-                    )
-                    if pix.n == 4:
-                        img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-
-                    if self.detect_rotation:
-                        from img2table.document.rotation import fix_rotation_image
-                        img, rotated = fix_rotation_image(img=img)
-                        self._rotated = self._rotated or rotated
-
-                    if self.preprocess:
-                        img = _preprocess_image(img)
-
-                    images.append(img)
-            finally:
-                doc.close()
-
-            self._images = images
-
-        return self._images
+_default_cell_ocr = TesseractCellOCR()
 
 
-def _preprocess_image(img):
-    """
-    Light, table-safe image cleanup to help OCR on noisy/low-contrast scans:
-    denoise + contrast normalization (CLAHE). Deliberately avoids hard
-    binarization, which tends to erase faint table borders that img2table's
-    line-detection relies on.
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    denoised = cv2.fastNlMeansDenoising(gray, h=10)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(denoised)
-    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+def _ocr_cell_image(gray_crop, rotate: bool = False, upscale: int = 3) -> str | None:
+    """Backward-compatible shim -- use providers.cell_ocr.TesseractCellOCR
+    directly for new code."""
+    return TesseractCellOCR(upscale=upscale).recognize(gray_crop, rotate=rotate)
 
 
 def _fix_rotated_cells(
@@ -200,6 +151,7 @@ def _fix_rotated_cells(
     ratio_threshold: float = 1.3,
     min_height: int = 100,
     upscale: int = 3,
+    cell_ocr: CellOCRProvider = None,
 ) -> int:
     """
     Detects and re-OCRs table cells whose text is rotated 90 degrees inside
@@ -234,6 +186,7 @@ def _fix_rotated_cells(
     if page_img is None:
         return 0
 
+    cell_ocr = cell_ocr or _default_cell_ocr
     gray_page = cv2.cvtColor(page_img, cv2.COLOR_RGB2GRAY)
     img_h, img_w = gray_page.shape[:2]
 
@@ -263,15 +216,7 @@ def _fix_rotated_cells(
                 x1, y1 = max(box.x1 + margin, 0), max(box.y1 + margin, 0)
                 x2, y2 = min(box.x2 - margin, img_w), min(box.y2 - margin, img_h)
                 crop = gray_page[y1:y2, x1:x2]
-                if crop.size == 0:
-                    ocr_cache[key] = None
-                else:
-                    rotated = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
-                    upscaled = cv2.resize(
-                        rotated, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_CUBIC
-                    )
-                    text = pytesseract.image_to_string(upscaled, config="--psm 6").strip()
-                    ocr_cache[key] = text or None
+                ocr_cache[key] = cell_ocr.recognize(crop, rotate=True)
 
             new_value = ocr_cache[key]
             if new_value:
@@ -279,105 +224,6 @@ def _fix_rotated_cells(
                 fixed_count += 1
 
     return fixed_count
-
-
-def _ocr_cell_image(gray_crop, rotate: bool = False, upscale: int = 3) -> str | None:
-    if gray_crop.size == 0:
-        return None
-    if rotate:
-        gray_crop = cv2.rotate(gray_crop, cv2.ROTATE_90_CLOCKWISE)
-    upscaled = cv2.resize(
-        gray_crop, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_CUBIC
-    )
-    text = pytesseract.image_to_string(upscaled, config="--psm 6").strip()
-    return text or None
-
-
-def _detect_grid_lines(gray, min_line_frac: float = 0.12, min_gap: int = 10):
-    """
-    Detects a table's row/column boundaries by direct classical line
-    detection (morphological opening with long horizontal/vertical
-    structuring elements) rather than relying on img2table's own table
-    detector. Used as a fallback for pages where img2table finds nothing,
-    or an implausibly small table, despite the page clearly containing a
-    full ruled grid (confirmed on real pages in testing -- img2table found
-    0 tables on several pages that this recovers cleanly).
-    :return: (row_boundary_ys, col_boundary_xs), each sorted ascending;
-        empty lists if no plausible grid was found.
-    """
-    h, w = gray.shape
-    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(w // 25, 15), 1))
-    horizontal = cv2.morphologyEx(bw, cv2.MORPH_OPEN, horiz_kernel, iterations=1)
-
-    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(h // 25, 15)))
-    vertical = cv2.morphologyEx(bw, cv2.MORPH_OPEN, vert_kernel, iterations=1)
-
-    h_rowsum = (horizontal > 0).sum(axis=1)
-    v_colsum = (vertical > 0).sum(axis=0)
-
-    def cluster_and_filter(indices, min_frac_len):
-        if len(indices) == 0:
-            return []
-        groups = [[int(indices[0])]]
-        for i in indices[1:]:
-            if i - groups[-1][-1] <= 5:
-                groups[-1].append(int(i))
-            else:
-                groups.append([int(i)])
-        positions = [int(np.mean(g)) for g in groups]
-        # Drop lines sitting implausibly close to the previous one (noise,
-        # not a real second grid line).
-        filtered = [positions[0]]
-        for p in positions[1:]:
-            if p - filtered[-1] >= min_gap:
-                filtered.append(p)
-        return filtered
-
-    row_lines = cluster_and_filter(np.where(h_rowsum > w * min_line_frac)[0], min_gap)
-    col_lines = cluster_and_filter(np.where(v_colsum > h * min_line_frac)[0], min_gap)
-    return row_lines, col_lines
-
-
-def _manual_grid_table(page_img, min_rows: int = 3, min_cols: int = 3):
-    """
-    Reconstructs a table for one page via direct grid-line detection plus
-    per-cell OCR (with the same rotated-text handling as _fix_rotated_cells),
-    returning an img2table ExtractedTable so it drops into the existing
-    xlsx-writing path unchanged. Returns None if no plausible grid is found.
-    """
-    gray = cv2.cvtColor(page_img, cv2.COLOR_RGB2GRAY)
-    img_h, img_w = gray.shape
-    row_lines, col_lines = _detect_grid_lines(gray)
-
-    if len(row_lines) < min_rows or len(col_lines) < min_cols:
-        return None
-
-    margin = 3
-    content = OrderedDict()
-    for r in range(len(row_lines) - 1):
-        y1, y2 = row_lines[r], row_lines[r + 1]
-        row_cells = []
-        for c in range(len(col_lines) - 1):
-            x1, x2 = col_lines[c], col_lines[c + 1]
-            w, h = x2 - x1, y2 - y1
-
-            cx1, cy1 = max(x1 + margin, 0), max(y1 + margin, 0)
-            cx2, cy2 = min(x2 - margin, img_w), min(y2 - margin, img_h)
-            crop = gray[cy1:cy2, cx1:cx2]
-
-            rotate = w > 0 and h > 0 and h >= 60 and (h / w) >= 1.3
-            value = _ocr_cell_image(crop, rotate=rotate)
-
-            row_cells.append(TableCell(bbox=BBox(x1=x1, y1=y1, x2=x2, y2=y2), value=value))
-        content[r] = row_cells
-
-    return ExtractedTable(
-        bbox=BBox(x1=col_lines[0], y1=row_lines[0], x2=col_lines[-1], y2=row_lines[-1]),
-        title=None,
-        content=content,
-    )
 
 
 def _consensus_correct_headers(
@@ -517,47 +363,6 @@ def _write_table_flagged(table, sheet, normal_fmt, flag_fmt) -> int:
     return flagged
 
 
-def _pick_extraction_mode(page_img, min_rows: int = 5) -> bool:
-    """
-    Cheaply (no OCR -- pure shape detection) compares bordered vs borderless
-    table detection for one page and returns whether borderless_tables
-    should be used. Confirmed on real documents that neither mode is
-    uniformly better, so a single fixed choice for a whole document is
-    unsafe: one document needed borderless to find a page's table at all
-    (the bordered/strict-grid detector found nothing there), while a
-    DIFFERENT document got WORSE under borderless -- it fragmented one
-    clean, complete table into multiple broken pieces that bordered alone
-    had found correctly as a single table. Deciding per page from actual
-    evidence on that page avoids both failure modes.
-    :return: True if borderless_tables should be used for this page
-    """
-    def score(tables):
-        good = [t for t in tables if len(t.rows) >= 3]
-        if not good:
-            return (-1, 0)
-        # Prefer more total rows, but also prefer fewer separate tables --
-        # a single coherent table splitting into several small fragments
-        # (each individually "big enough") is exactly the failure mode
-        # being guarded against here.
-        return (sum(len(t.rows) for t in good), -len(good))
-
-    bordered = TableExtractor(img=page_img).extract_tables(
-        implicit_rows=True, implicit_columns=False, borderless_tables=False
-    )
-    borderless = TableExtractor(img=page_img).extract_tables(
-        implicit_rows=True, implicit_columns=False, borderless_tables=True
-    )
-    bordered_score = score(bordered)
-    borderless_score = score(borderless)
-
-    # Bordered is the stricter, cleaner method when it finds anything
-    # plausible at all; only reach for borderless when bordered came up
-    # empty/implausible, or borderless is a clear, real improvement.
-    if bordered_score[0] >= min_rows and borderless_score <= bordered_score:
-        return False
-    return borderless_score[0] > bordered_score[0]
-
-
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
 
 
@@ -620,10 +425,16 @@ def convert_scanned_to_excel(
     consensus_fix_headers: bool = True,
     flag_suspicious_cells: bool = True,
     auto_detect_mode: bool = True,
+    progress: Callable[[str], None] = print,
 ) -> str:
     """
     Detects file type (image / scanned PDF / text PDF) and exports detected
     tables to an .xlsx file. Returns the output path on success.
+
+    :param progress: called with a short human-readable status string at
+        each pipeline stage. Defaults to `print` (matching this function's
+        original CLI-only behavior); pass something else (e.g. a job's log
+        appender) to use this from a non-CLI caller without scraping stdout.
     """
     if not check_tesseract_available(tesseract_cmd):
         raise EnvironmentError(
@@ -644,7 +455,7 @@ def convert_scanned_to_excel(
             os.environ["PATH"] = tess_dir + os.pathsep + os.environ.get("PATH", "")
 
     file_type = detect_file_type(file_path)
-    print(f"Detected file type: {file_type}")
+    progress(f"Detected file type: {file_type}")
 
     ocr = TesseractOCR(n_threads=n_threads, lang=lang)
 
@@ -666,123 +477,33 @@ def convert_scanned_to_excel(
         )
 
     # PDF/HighResPDF only populates .pages lazily (as a side effect of
-    # .images or .extract_tables()); force it now since the auto-mode path
-    # below needs the full page list before calling extract_tables(). Image
-    # sets .pages directly at construction and has no such method.
+    # .images or .extract_tables()); force it now since the detector needs
+    # the full page list before calling extract_tables(). Image sets .pages
+    # directly at construction and has no such method.
     if hasattr(doc, "_ensure_pages"):
         doc._ensure_pages()
     pages = getattr(doc, "pages", None) or [0]
     page_to_image = {page_num: doc.images[k] for k, page_num in enumerate(pages)}
 
-    print("Extracting tables...")
-    if auto_detect_mode and file_type != "image":
-        # Decide bordered-vs-borderless per page from actual evidence on
-        # that page, rather than one fixed choice for the whole document --
-        # confirmed necessary on real documents: one needed borderless to
-        # find a page's table at all, while a DIFFERENT document got worse
-        # under borderless (fragmented one clean table into broken pieces
-        # bordered alone had found correctly). Grouped into two batched OCR
-        # passes rather than one call per page, so this doesn't double the
-        # OCR cost of the whole document.
-        borderless_pages = [p for p in pages if _pick_extraction_mode(page_to_image[p])]
-        bordered_pages = [p for p in pages if p not in borderless_pages]
-        if borderless_pages and bordered_pages:
-            print(
-                f"Auto-selected table-detection mode per page: "
-                f"{len(bordered_pages)} page(s) bordered, "
-                f"{len(borderless_pages)} page(s) borderless."
-            )
-
-        extracted_tables = {}
-        for mode, mode_pages in ((False, bordered_pages), (True, borderless_pages)):
-            if not mode_pages:
-                continue
-            sub_doc = HighResPDF(
-                src=file_path,
-                dpi=dpi,
-                preprocess=preprocess,
-                detect_rotation=auto_rotate,
-                pages=mode_pages,
-                _images=[page_to_image[p] for p in mode_pages],
-            )
-            extracted_tables.update(
-                sub_doc.extract_tables(
-                    ocr=ocr, implicit_rows=True, borderless_tables=mode, min_confidence=50
-                )
-            )
-    else:
-        extracted_tables = doc.extract_tables(
-            ocr=ocr,
-            implicit_rows=True,
-            borderless_tables=borderless_tables,
-            min_confidence=50,
-        )
-        # Both Image (list) and PDF (dict keyed by page number) are
-        # supported by img2table's own to_xlsx(); normalize the same way.
-        extracted_tables = (
-            {0: extracted_tables} if isinstance(extracted_tables, list) else extracted_tables
-        )
-
-    if use_grid_fallback:
-        # img2table's own detector can fail outright on some pages (0
-        # tables), return an implausibly small result, or -- confirmed on a
-        # real document -- quietly collapse columns during its own
-        # OCR-based refinement step (one page's raw geometric detection
-        # found 20 columns; after OCR that same table shrank to 16, with
-        # the dropped trailing columns' values replaced by leftover header
-        # text repeated into every row). Any of these silently loses real
-        # data, so fall back to direct grid-line detection (classical CV,
-        # bypassing img2table's detector and its content-refinement step
-        # entirely) rather than accepting a quietly-truncated result.
-        MIN_PLAUSIBLE_ROWS = 8
-        MIN_COLUMN_RETENTION = 0.85
-        fallback_pages = set()
-        for page in pages:
-            existing = extracted_tables.get(page, [])
-            best_table = max(existing, key=lambda t: len(t.content), default=None)
-            best_rows = len(best_table.content) if best_table else 0
-            best_cols = (
-                max((len(c) for c in best_table.content.values()), default=0)
-                if best_table
-                else 0
-            )
-            page_img = page_to_image.get(page)
-
-            needs_fallback = best_rows < MIN_PLAUSIBLE_ROWS
-            if not needs_fallback and page_img is not None:
-                # Cheap, no-OCR shape check as a sanity reference for the
-                # column-collapse case above.
-                raw_tables = TableExtractor(img=page_img).extract_tables(
-                    implicit_rows=True, implicit_columns=False, borderless_tables=False
-                )
-                raw_cols = max((len(row.cells) for t in raw_tables for row in t.rows), default=0)
-                if raw_cols > 0 and best_cols < raw_cols * MIN_COLUMN_RETENTION:
-                    needs_fallback = True
-
-            if not needs_fallback or page_img is None:
-                continue
-
-            manual_table = _manual_grid_table(page_img)
-            if manual_table is None:
-                continue
-            manual_rows = len(manual_table.content)
-            manual_cols = max((len(c) for c in manual_table.content.values()), default=0)
-            # Prefer the manual grid if it has more rows outright, or a
-            # comparable row count with meaningfully more columns (the
-            # column-collapse case, where row count alone looks fine).
-            is_better = manual_rows > best_rows or (
-                manual_rows >= best_rows * 0.8 and manual_cols > best_cols
-            )
-            if is_better:
-                extracted_tables[page] = [manual_table]
-                fallback_pages.add(page)
-
-        if fallback_pages:
-            print(
-                f"Recovered {len(fallback_pages)} page(s) via direct grid-line detection "
-                f"(img2table's own detector found nothing usable there): "
-                f"{sorted(p + 1 for p in fallback_pages)}"
-            )
+    progress("Extracting tables...")
+    detector = TableDetector(
+        dpi=dpi,
+        preprocess=preprocess,
+        auto_rotate=auto_rotate,
+        auto_detect_mode=auto_detect_mode,
+        use_grid_fallback=use_grid_fallback,
+        cell_ocr=_default_cell_ocr,
+    )
+    extracted_tables, fallback_pages = detector.detect_all(
+        file_path=file_path,
+        doc=doc,
+        file_type=file_type,
+        pages=pages,
+        page_to_image=page_to_image,
+        ocr=ocr,
+        borderless_tables=borderless_tables,
+        progress=progress,
+    )
 
     if fix_rotated_headers:
         # Cells from the grid-line fallback already went through the same
@@ -790,13 +511,13 @@ def convert_scanned_to_excel(
         # redo it for those pages.
         total_fixed = 0
         for page, tables in extracted_tables.items():
-            if page in fallback_pages if use_grid_fallback else False:
+            if page in fallback_pages:
                 continue
             page_img = page_to_image.get(page)
             for table in tables:
-                total_fixed += _fix_rotated_cells(table, page_img)
+                total_fixed += _fix_rotated_cells(table, page_img, cell_ocr=_default_cell_ocr)
         if total_fixed:
-            print(f"Re-OCR'd {total_fixed} rotated-text cell(s) (e.g. sideways column headers).")
+            progress(f"Re-OCR'd {total_fixed} rotated-text cell(s) (e.g. sideways column headers).")
 
     if consensus_fix_headers:
         # Module name/code headers repeat identically across every page of
@@ -805,12 +526,12 @@ def convert_scanned_to_excel(
         # rather than trusting each page's OCR result in isolation.
         n_corrected = _consensus_correct_headers(extracted_tables)
         if n_corrected:
-            print(
+            progress(
                 f"Corrected {n_corrected} header cell(s) using cross-page agreement "
                 f"(same module name/code printed on multiple pages)."
             )
 
-    print("Writing to Excel...")
+    progress("Writing to Excel...")
     workbook = xlsxwriter.Workbook(output_excel_path, {"in_memory": True})
     cell_format = workbook.add_format({"align": "center", "valign": "vcenter", "text_wrap": True})
     cell_format.set_border()
@@ -830,7 +551,7 @@ def convert_scanned_to_excel(
     workbook.close()
 
     if flag_suspicious_cells and total_flagged:
-        print(
+        progress(
             f"\nFlagged {total_flagged} cell(s) (highlighted yellow) whose OCR text looks "
             f"suspicious -- e.g. stray symbols, mismatched decimal separators, or leftover "
             f"'None' from a merged/failed read. This is NOT a claim those cells are wrong, "
@@ -840,7 +561,7 @@ def convert_scanned_to_excel(
             f"how to keep that honest rather than hide it."
         )
 
-    print(f"Done. Excel file saved to: {output_excel_path}")
+    progress(f"Done. Excel file saved to: {output_excel_path}")
     return output_excel_path
 
 
