@@ -1,6 +1,6 @@
 """
 Tests for the API (documents_converter/api/app.py): Phase 3 (the basic
-endpoints) and Phase 4 (security hardening on top of them).
+endpoints), Phase 4 (security hardening), and Phase 6 (API-key auth).
 
 Uses the same synthetic, fabricated fixture as the pipeline tests -- see
 tests/fixtures/synthetic_scan.py and docs/PHASE_0_AUDIT.md risk register
@@ -174,3 +174,58 @@ def test_convert_times_out_on_a_slow_conversion(monkeypatch, synthetic_pdf, tess
             files={"file": ("synthetic_scan.pdf", f, "application/pdf")},
         )
     assert resp.status_code == 504
+
+
+# --------------------------------------------------------------------------
+# Phase 6: API-key authentication (docs/PHASE_0_AUDIT.md).
+# --------------------------------------------------------------------------
+
+_junk_file = {"file": ("x.xyz", io.BytesIO(b"data"), "application/octet-stream")}
+
+
+def test_convert_works_without_auth_when_no_keys_configured():
+    """Default state: config.API_KEYS is empty, so auth is off and a request
+    with no Authorization header at all must not be rejected with 401 --
+    it should reach the normal extension check instead (400, not 401)."""
+    assert config.API_KEYS == ()  # the actual default, not assumed
+    resp = client.post("/api/v1/convert", files=_junk_file)
+    assert resp.status_code == 400
+
+
+def test_convert_requires_api_key_when_configured(monkeypatch):
+    monkeypatch.setattr(config, "API_KEYS", ("secret-key-1",))
+    resp = client.post("/api/v1/convert", files=_junk_file)
+    assert resp.status_code == 401
+    assert "Authorization" in resp.json()["detail"]
+
+
+def test_convert_rejects_wrong_api_key(monkeypatch):
+    monkeypatch.setattr(config, "API_KEYS", ("secret-key-1",))
+    resp = client.post(
+        "/api/v1/convert",
+        files=_junk_file,
+        headers={"Authorization": "Bearer wrong-key"},
+    )
+    assert resp.status_code == 401
+    assert "Invalid API key" in resp.json()["detail"]
+
+
+def test_convert_accepts_a_valid_api_key(monkeypatch):
+    """A correct key should pass the auth check and reach the normal
+    pipeline (proven here by getting the extension-rejection 400, not an
+    auth-related 401 -- a full OCR run isn't needed to prove auth passed)."""
+    monkeypatch.setattr(config, "API_KEYS", ("secret-key-1", "secret-key-2"))
+    resp = client.post(
+        "/api/v1/convert",
+        files=_junk_file,
+        headers={"Authorization": "Bearer secret-key-2"},
+    )
+    assert resp.status_code == 400  # extension rejection, i.e. auth passed
+
+
+def test_health_never_requires_auth(monkeypatch):
+    """Load balancers and monitoring probes need to reach /health without
+    credentials, even when auth is otherwise enabled."""
+    monkeypatch.setattr(config, "API_KEYS", ("secret-key-1",))
+    resp = client.get("/health")
+    assert resp.status_code == 200

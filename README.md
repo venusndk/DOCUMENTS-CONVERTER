@@ -26,6 +26,7 @@ documents_converter/
         config.py                    environment-based API configuration
         security.py                  magic-byte + decompression-bomb checks
         rate_limit.py                per-IP fixed-window rate limiter
+        auth.py                      API-key authentication
 tests/
     conftest.py
     test_ocr_excel.py                 pipeline/provider regression tests
@@ -116,7 +117,29 @@ Configuration (environment variables, see `documents_converter/api/config.py`):
 `TESSERACT_CMD` (default: none, i.e. must be on `PATH`), `MAX_UPLOAD_MB`
 (default: 50), `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS`
 (default: 10 requests per 60s per client IP), `CONVERT_TIMEOUT_SECONDS`
-(default: 180).
+(default: 180), `API_KEYS` (default: empty, i.e. auth off — see below).
+
+### Authentication
+
+`POST /api/v1/convert` requires an API key once `API_KEYS` is set to a
+comma-separated list; `GET /health` never does (load balancers and
+monitoring probes need to reach it without credentials). Empty by
+default so local/dev use needs no extra setup — set it before exposing
+this to anything other than trusted local use.
+
+```powershell
+$env:API_KEYS = "some-long-random-key,another-key-for-a-second-caller"
+```
+
+```powershell
+curl.exe -H "Authorization: Bearer some-long-random-key" -F "file=@transcript.pdf" http://127.0.0.1:8000/api/v1/convert -o result.xlsx
+```
+
+This is deliberately API keys, not user accounts — there's no database
+yet, and building one before there's an actual need for per-user data
+(history, usage billing) would repeat exactly the kind of premature
+infrastructure `docs/PHASE_0_AUDIT.md` warns against. A real identity
+system is a reasonable later phase once that need exists.
 
 ### Security hardening
 
@@ -143,9 +166,10 @@ naming, no document-content logging), the API also has:
   any unexpected error returns a generic message, regardless of what
   actually went wrong.
 
-Still explicitly out of scope (see `docs/PHASE_0_AUDIT.md` Phase Plan):
-authentication, and the rate limiter's single-process limitation above.
-Not yet suitable for untrusted public traffic without those.
+Combined with the Authentication section above, the API is now closer to
+suitable for untrusted traffic — the main remaining gap is the rate
+limiter's single-process limitation noted there, which matters once this
+runs as more than one replica.
 
 ### Running the API in Docker
 

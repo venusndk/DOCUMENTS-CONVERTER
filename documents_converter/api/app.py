@@ -16,6 +16,11 @@ logging): magic-byte validation, decompression-bomb limits, per-IP rate
 limiting, a best-effort conversion timeout, and a catch-all exception
 handler so nothing unexpected ever leaks a stack trace to the caller.
 
+Phase 6 added API-key authentication on /api/v1/convert (see auth.py) --
+disabled by default until config.API_KEYS is set, so local/dev use needs
+no extra setup. /health stays unauthenticated on purpose: load balancers
+and monitoring probes need to reach it without credentials.
+
 Run locally:
     uvicorn documents_converter.api.app:app --reload
 """
@@ -28,13 +33,14 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 from PIL import Image as PILImage
 
 import fitz
 
 from . import config, security
+from .auth import require_api_key
 from .rate_limit import FixedWindowRateLimiter
 from ..ocr_excel import check_tesseract_available, convert_scanned_to_excel
 
@@ -66,7 +72,7 @@ def health() -> dict:
     }
 
 
-@app.post("/api/v1/convert")
+@app.post("/api/v1/convert", dependencies=[Depends(require_api_key)])
 def convert(request: Request, file: UploadFile) -> Response:
     """
     Accepts one scanned PDF or image, returns the extracted table(s) as an
