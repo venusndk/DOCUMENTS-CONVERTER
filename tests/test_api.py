@@ -5,9 +5,20 @@ endpoints), Phase 4 (security hardening), and Phase 6 (API-key auth).
 Uses the same synthetic, fabricated fixture as the pipeline tests -- see
 tests/fixtures/synthetic_scan.py and docs/PHASE_0_AUDIT.md risk register
 item #1 for why real scanned documents are never used here.
+
+Tests that submit a real async job always wait for it to reach a
+terminal status (_wait_for_job_terminal) before returning, even ones
+that aren't primarily testing job completion. Confirmed the hard way:
+a test that submitted a job and returned immediately without waiting
+left it running in the background, competing with the *next* test's
+job for the same worker pool -- invisible on a fast dev machine, but
+enough contention on GitHub Actions' 2-vCPU runner to push a later
+job's test past its deadline. Real CI failure, not a pipeline bug --
+see the fix commit for the full story.
 """
 
 import io
+import time
 import zipfile
 
 import openpyxl
@@ -183,6 +194,27 @@ def test_convert_times_out_on_a_slow_conversion(monkeypatch, synthetic_pdf, tess
 _junk_file = {"file": ("x.xyz", io.BytesIO(b"data"), "application/octet-stream")}
 
 
+def _wait_for_job_terminal(job_id: str, timeout: float = 120) -> str:
+    """
+    Polls a job until it reaches a terminal status (completed/failed) or
+    `timeout` elapses, returning the last observed status. 120s default,
+    not the 60s originally used here -- CI hardware (GitHub Actions'
+    ubuntu-latest runner: 2 vCPUs) is genuinely slower than a typical dev
+    machine for CPU-bound OCR work, confirmed by reproducing the CI
+    environment locally rather than guessed at.
+    """
+    deadline = time.monotonic() + timeout
+    status = None
+    while time.monotonic() < deadline:
+        status_resp = client.get(f"/api/v1/jobs/{job_id}")
+        assert status_resp.status_code == 200
+        status = status_resp.json()["status"]
+        if status in ("completed", "failed"):
+            return status
+        time.sleep(0.5)
+    return status
+
+
 def test_convert_works_without_auth_when_no_keys_configured():
     """Default state: config.API_KEYS is empty, so auth is off and a request
     with no Authorization header at all must not be rejected with 401 --
@@ -279,14 +311,18 @@ def test_create_job_returns_202_with_a_pollable_status(synthetic_pdf, tesseract_
     # this early would not be.
     assert body["status"] in ("queued", "processing")
 
+    # Wait for it to actually finish before this test returns -- otherwise
+    # it keeps running in the background, competing with whatever the next
+    # test does on the same worker pool (see module docstring: this is
+    # exactly what caused a real CI failure).
+    assert _wait_for_job_terminal(body["job_id"]) == "completed"
+
 
 @requires_tesseract
 def test_job_lifecycle_completes_with_correct_result(synthetic_pdf, tesseract_cmd, monkeypatch):
     """Full async round trip: submit, poll until done, download the
     result, and check it against the same expected values already locked
     in by the synchronous end-to-end test."""
-    import time
-
     monkeypatch.setattr(config, "TESSERACT_CMD", tesseract_cmd)
     with open(synthetic_pdf, "rb") as f:
         resp = client.post(
@@ -294,16 +330,7 @@ def test_job_lifecycle_completes_with_correct_result(synthetic_pdf, tesseract_cm
         )
     job_id = resp.json()["job_id"]
 
-    deadline = time.monotonic() + 60
-    status = None
-    while time.monotonic() < deadline:
-        status_resp = client.get(f"/api/v1/jobs/{job_id}")
-        assert status_resp.status_code == 200
-        status = status_resp.json()["status"]
-        if status in ("completed", "failed"):
-            break
-        time.sleep(0.5)
-
+    status = _wait_for_job_terminal(job_id)
     assert status == "completed", f"job did not complete in time (last status: {status})"
 
     result_resp = client.get(f"/api/v1/jobs/{job_id}/result")
