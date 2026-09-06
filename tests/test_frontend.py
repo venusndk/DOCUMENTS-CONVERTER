@@ -124,7 +124,7 @@ def test_frontend_shows_error_for_rejected_upload(running_app_server, tmp_path):
             page.locator("#submit-btn").click()
             status = page.locator("#status")
             page.wait_for_function(
-                "document.getElementById('status').className === 'err'", timeout=10_000
+                "document.getElementById('status').className === 'error'", timeout=10_000
             )
             assert "Unsupported file type" in status.inner_text()
         finally:

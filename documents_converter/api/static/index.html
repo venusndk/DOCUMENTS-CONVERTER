@@ -13,8 +13,48 @@
     --accent: #4f46e5;
     --accent-hover: #4338ca;
     --border: #e5e7eb;
-    --ok: #16a34a;
-    --err: #dc2626;
+
+    /* Semantic status colors (Phase 10, docs/PHASE_0_AUDIT.md numbering
+       continued): one fixed meaning per color, used everywhere this page
+       shows a job/file status -- there is currently exactly one place
+       that does (#status), but these are the tokens any future status
+       display (a job list, a per-file badge, etc.) should reuse instead
+       of hardcoding a new color. The four base hex values are the
+       contract; only the derived surface/text pairs differ by theme. */
+    --status-success: #22C55E;
+    --status-processing: #F59E0B;
+    --status-error: #EF4444;
+    --status-neutral: #64748B;
+
+    --status-success-surface: #ECFDF5;
+    --status-success-text: #15803D;
+    --status-processing-surface: #FFFBEB;
+    --status-processing-text: #B45309;
+    --status-error-surface: #FEF2F2;
+    --status-error-text: #B91C1C;
+    --status-neutral-surface: #F1F5F9;
+    --status-neutral-text: #475569;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --card: #181b21;
+      --ink: #e5e7eb;
+      --muted: #9aa1ac;
+      --border: #2a2e37;
+
+      /* Same four semantic colors, still used as the accent/icon color at
+         full strength -- only the subtle surfaces and their paired text
+         shift to stay readable on a dark card. */
+      --status-success-surface: rgba(34, 197, 94, 0.14);
+      --status-success-text: #4ADE80;
+      --status-processing-surface: rgba(245, 158, 11, 0.16);
+      --status-processing-text: #FBBF24;
+      --status-error-surface: rgba(239, 68, 68, 0.16);
+      --status-error-text: #F87171;
+      --status-neutral-surface: rgba(100, 116, 139, 0.18);
+      --status-neutral-text: #B0B8C4;
+    }
   }
   * { box-sizing: border-box; }
   body {
@@ -46,7 +86,7 @@
     cursor: pointer;
     transition: border-color 0.15s, background 0.15s;
   }
-  #dropzone.dragover { border-color: var(--accent); background: #eef2ff; }
+  #dropzone.dragover { border-color: var(--accent); background: rgba(79, 70, 229, 0.15); }
   #dropzone p { margin: 0; color: var(--muted); }
   #dropzone strong { color: var(--ink); }
   #file-input { display: none; }
@@ -66,6 +106,8 @@
     border: 1px solid var(--border);
     border-radius: 8px;
     font-size: 0.95rem;
+    background: var(--card);
+    color: var(--ink);
   }
 
   button {
@@ -90,9 +132,29 @@
     font-size: 0.9rem;
     display: none;
   }
-  #status.info { display: block; background: #eef2ff; color: var(--accent); }
-  #status.ok { display: block; background: #f0fdf4; color: var(--ok); }
-  #status.err { display: block; background: #fef2f2; color: var(--err); }
+  /* Semantic status classes -- named for what they mean, not what they
+     look like, so a future status display can adopt the same three
+     classes instead of inventing its own colors. One meaning per class:
+     processing (amber) while a job is queued/uploading/converting,
+     success (green) once it's done, error (red) if it failed. There is
+     no visible "neutral" class here because idle already has its own
+     representation (the status box is simply hidden) rather than a
+     visible gray badge. */
+  #status.processing {
+    display: block;
+    background: var(--status-processing-surface);
+    color: var(--status-processing-text);
+  }
+  #status.success {
+    display: block;
+    background: var(--status-success-surface);
+    color: var(--status-success-text);
+  }
+  #status.error {
+    display: block;
+    background: var(--status-error-surface);
+    color: var(--status-error-text);
+  }
 
   #download-link {
     display: none;
@@ -124,7 +186,7 @@
 
     <button id="submit-btn" disabled>Convert</button>
 
-    <div id="status"></div>
+    <div id="status" role="status" aria-live="polite"></div>
     <a id="download-link" href="#">⬇ Download converted.xlsx</a>
 
     <p class="footnote">
@@ -164,9 +226,18 @@
     submitBtn.disabled = false;
   }
 
+  // Icon prefixes pair with the semantic status classes above (CSS) so
+  // color is never the only signal -- a person with a color-vision
+  // deficiency, or anyone skimming without color, still gets "processing"
+  // vs "success" vs "error" from the glyph and the text alone. Defined
+  // once here rather than inline at each call site, the same "one
+  // semantic meaning, one place" principle as the CSS tokens.
+  const STATUS_ICONS = { processing: "⟳", success: "✓", error: "✕" };
+
   function setStatus(kind, message) {
     statusEl.className = kind;
-    statusEl.textContent = message;
+    const icon = STATUS_ICONS[kind];
+    statusEl.textContent = icon ? `${icon} ${message}` : message;
   }
 
   function authHeaders() {
@@ -184,7 +255,7 @@
       const body = await resp.json();
       if (body.status === "completed") return;
       if (body.status === "failed") throw new Error(body.error || "Conversion failed.");
-      setStatus("info", `Converting… (${body.status})`);
+      setStatus("processing", `Converting… (${body.status})`);
       await new Promise((r) => setTimeout(r, 1000));
     }
   }
@@ -207,7 +278,7 @@
     if (!selectedFile) return;
     submitBtn.disabled = true;
     downloadLink.style.display = "none";
-    setStatus("info", "Uploading…");
+    setStatus("processing", "Uploading…");
 
     try {
       const formData = new FormData();
@@ -224,13 +295,13 @@
       }
       const { job_id } = await resp.json();
 
-      setStatus("info", "Converting…");
+      setStatus("processing", "Converting…");
       await pollJob(job_id);
 
-      setStatus("ok", "Done! Your download should start automatically.");
+      setStatus("success", "Done! Your download should start automatically.");
       await downloadResult(job_id);
     } catch (err) {
-      setStatus("err", err.message || "Something went wrong.");
+      setStatus("error", err.message || "Something went wrong.");
     } finally {
       submitBtn.disabled = false;
     }
