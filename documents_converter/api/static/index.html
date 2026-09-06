@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Documents Converter</title>
+<style>
+  :root {
+    --bg: #f7f7f9;
+    --card: #ffffff;
+    --ink: #1a1a2e;
+    --muted: #6b7280;
+    --accent: #4f46e5;
+    --accent-hover: #4338ca;
+    --border: #e5e7eb;
+    --ok: #16a34a;
+    --err: #dc2626;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    display: flex;
+    justify-content: center;
+    padding: 48px 16px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 32px;
+    max-width: 520px;
+    width: 100%;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+  }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); font-size: 0.9rem; margin: 0 0 24px; }
+
+  #dropzone {
+    border: 2px dashed var(--border);
+    border-radius: 10px;
+    padding: 32px 16px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  #dropzone.dragover { border-color: var(--accent); background: #eef2ff; }
+  #dropzone p { margin: 0; color: var(--muted); }
+  #dropzone strong { color: var(--ink); }
+  #file-input { display: none; }
+
+  #file-name {
+    margin-top: 12px;
+    font-size: 0.9rem;
+    color: var(--ink);
+    display: none;
+  }
+
+  .field { margin-top: 20px; }
+  label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 6px; }
+  input[type="text"], input[type="password"] {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 0.95rem;
+  }
+
+  button {
+    margin-top: 24px;
+    width: 100%;
+    padding: 12px;
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: var(--accent-hover); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  #status {
+    margin-top: 20px;
+    padding: 14px;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    display: none;
+  }
+  #status.info { display: block; background: #eef2ff; color: var(--accent); }
+  #status.ok { display: block; background: #f0fdf4; color: var(--ok); }
+  #status.err { display: block; background: #fef2f2; color: var(--err); }
+
+  #download-link {
+    display: none;
+    margin-top: 12px;
+    text-align: center;
+    color: var(--accent);
+    font-weight: 600;
+    text-decoration: none;
+  }
+
+  .footnote { margin-top: 24px; font-size: 0.75rem; color: var(--muted); text-align: center; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Scanned Document → Excel</h1>
+    <p class="subtitle">Upload a scanned PDF or image. We'll detect the table(s) and hand you back an .xlsx.</p>
+
+    <div id="dropzone">
+      <p><strong>Click to choose a file</strong> or drag one here</p>
+      <p id="file-name"></p>
+    </div>
+    <input type="file" id="file-input" accept=".pdf,.png,.jpg,.jpeg,.tiff,.tif,.bmp">
+
+    <div class="field" id="api-key-field">
+      <label for="api-key">API key (only needed if the server requires one)</label>
+      <input type="password" id="api-key" placeholder="Leave blank if not required" autocomplete="off">
+    </div>
+
+    <button id="submit-btn" disabled>Convert</button>
+
+    <div id="status"></div>
+    <a id="download-link" href="#">⬇ Download converted.xlsx</a>
+
+    <p class="footnote">
+      Nothing is stored beyond what's needed to process your file.
+      See the project README for details on how conversion works.
+    </p>
+  </div>
+
+<script>
+(() => {
+  const dropzone = document.getElementById("dropzone");
+  const fileInput = document.getElementById("file-input");
+  const fileNameEl = document.getElementById("file-name");
+  const apiKeyInput = document.getElementById("api-key");
+  const submitBtn = document.getElementById("submit-btn");
+  const statusEl = document.getElementById("status");
+  const downloadLink = document.getElementById("download-link");
+
+  let selectedFile = null;
+
+  dropzone.addEventListener("click", () => fileInput.click());
+  dropzone.addEventListener("dragover", (e) => { e.preventDefault(); dropzone.classList.add("dragover"); });
+  dropzone.addEventListener("dragleave", () => dropzone.classList.remove("dragover"));
+  dropzone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dropzone.classList.remove("dragover");
+    if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener("change", () => {
+    if (fileInput.files.length) setFile(fileInput.files[0]);
+  });
+
+  function setFile(file) {
+    selectedFile = file;
+    fileNameEl.textContent = file.name;
+    fileNameEl.style.display = "block";
+    submitBtn.disabled = false;
+  }
+
+  function setStatus(kind, message) {
+    statusEl.className = kind;
+    statusEl.textContent = message;
+  }
+
+  function authHeaders() {
+    const key = apiKeyInput.value.trim();
+    return key ? { "Authorization": "Bearer " + key } : {};
+  }
+
+  async function pollJob(jobId) {
+    while (true) {
+      const resp = await fetch(`/api/v1/jobs/${jobId}`, { headers: authHeaders() });
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        throw new Error(body.detail || `Status check failed (${resp.status})`);
+      }
+      const body = await resp.json();
+      if (body.status === "completed") return;
+      if (body.status === "failed") throw new Error(body.error || "Conversion failed.");
+      setStatus("info", `Converting… (${body.status})`);
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+
+  async function downloadResult(jobId) {
+    const resp = await fetch(`/api/v1/jobs/${jobId}/result`, { headers: authHeaders() });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || `Download failed (${resp.status})`);
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    downloadLink.href = url;
+    downloadLink.download = "converted.xlsx";
+    downloadLink.style.display = "block";
+    downloadLink.click();
+  }
+
+  submitBtn.addEventListener("click", async () => {
+    if (!selectedFile) return;
+    submitBtn.disabled = true;
+    downloadLink.style.display = "none";
+    setStatus("info", "Uploading…");
+
+    try {
+      const formData = new FormData();
+      formData.append("file", selectedFile);
+
+      const resp = await fetch("/api/v1/jobs", {
+        method: "POST",
+        headers: authHeaders(),
+        body: formData,
+      });
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        throw new Error(body.detail || `Upload failed (${resp.status})`);
+      }
+      const { job_id } = await resp.json();
+
+      setStatus("info", "Converting…");
+      await pollJob(job_id);
+
+      setStatus("ok", "Done! Your download should start automatically.");
+      await downloadResult(job_id);
+    } catch (err) {
+      setStatus("err", err.message || "Something went wrong.");
+    } finally {
+      submitBtn.disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>

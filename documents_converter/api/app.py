@@ -44,7 +44,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from PIL import Image as PILImage
 
 import fitz
@@ -70,6 +70,23 @@ _job_store = JobStore(retention_seconds=config.JOB_RETENTION_SECONDS)
 _convert_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="convert")
 
 XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_STATIC_DIR = Path(__file__).parent / "static"
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def index() -> str:
+    """
+    Phase 8 (docs/PHASE_0_AUDIT.md): a real, usable page for the API this
+    project spent seven phases hardening -- until now, using it meant
+    writing curl commands. Deliberately a single self-contained HTML file
+    with inline CSS/JS, served directly rather than through a separate
+    frontend build/deploy pipeline: it calls the same /api/v1/jobs
+    endpoints any other client would, with no server-side templating or
+    extra state, so there's nothing here that needs its own test
+    infrastructure beyond "does it load and does it work in a real
+    browser" -- see tests/test_frontend.py.
+    """
+    return (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
 
 @app.get("/health")

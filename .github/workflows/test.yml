@@ -35,5 +35,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -r requirements-api.txt -r requirements-dev.txt
 
+      - name: Install Playwright browser
+        # tests/test_frontend.py drives a real headless browser against the
+        # actual frontend -- --with-deps pulls the OS libraries Chromium
+        # needs that aren't already covered by the Tesseract step above.
+        run: playwright install chromium --with-deps
+
       - name: Run tests
         run: pytest tests/ -v

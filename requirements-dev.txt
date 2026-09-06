@@ -1,4 +1,11 @@
 # Additional dependencies for running the test suite. Install alongside
-# requirements.txt: pip install -r requirements.txt -r requirements-dev.txt
+# requirements.txt AND requirements-api.txt (tests/test_api.py and
+# tests/test_frontend.py both import and run the API app, which needs
+# fastapi/uvicorn from there): pip install -r requirements.txt
+# -r requirements-api.txt -r requirements-dev.txt
 pytest==9.0.2
-httpx==0.28.1   # needed by fastapi.testclient.TestClient, tests/test_api.py
+httpx==0.28.1       # needed by fastapi.testclient.TestClient, tests/test_api.py
+requests==2.34.2    # tests/test_frontend.py's live-server health check
+playwright==1.59.0  # tests/test_frontend.py -- real browser tests for the
+                    # frontend. Also needs a one-time browser install:
+                    #   playwright install chromium --with-deps

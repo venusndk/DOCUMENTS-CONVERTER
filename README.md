@@ -28,10 +28,12 @@ documents_converter/
         rate_limit.py                per-IP fixed-window rate limiter
         auth.py                      API-key authentication
         jobs.py                      in-memory async job store
+        static/index.html            the web page -- upload, convert, download
 tests/
     conftest.py
     test_ocr_excel.py                 pipeline/provider regression tests
     test_api.py                        API tests
+    test_frontend.py                   real-browser (Playwright) frontend tests
     fixtures/synthetic_scan.py        generates a fabricated (no real data) test PDF
 docs/
     PHASE_0_AUDIT.md                  current-state audit, capability matrix, phase plan
@@ -86,10 +88,28 @@ you've confirmed on your own document that the override actually helps
 (see the DPI/preprocess note below, both of which measured *worse* than
 the default on the real document this was tuned against).
 
+## Web page
+
+Open `http://127.0.0.1:8000/` (or wherever the API is running) in a
+browser for a real, no-curl-required page: choose or drag a file, click
+Convert, watch it process, and the finished `.xlsx` downloads
+automatically. A single self-contained HTML file
+(`documents_converter/api/static/index.html`, inline CSS/JS, no build
+step) served directly by the API, calling the same `/api/v1/jobs`
+endpoints documented below — nothing here has its own state or logic
+beyond what those endpoints already provide and already have tests for.
+
+Verified with a real headless browser (Playwright), not just by reading
+the HTML: `tests/test_frontend.py` actually loads the page, picks a file
+through the real file input, clicks the real button, and confirms a real
+file downloads with correct data — the same standard as every other
+end-to-end test in this project.
+
 ## HTTP API (optional)
 
 An API wraps the same engine, for anything that needs to call this over
-HTTP instead of the CLI. Two ways to call it:
+HTTP instead of the CLI (the web page above is itself just a client of
+it). Two ways to call it:
 
 ```powershell
 pip install -r requirements.txt -r requirements-api.txt
@@ -232,11 +252,12 @@ development.
 
 ```powershell
 pip install -r requirements.txt -r requirements-api.txt -r requirements-dev.txt
+playwright install chromium --with-deps   # one-time; needed by test_frontend.py
 pytest tests/ -v
 ```
 
-(`requirements-api.txt` is needed too since `tests/test_api.py` imports the
-API app.)
+(`requirements-api.txt` is needed too since `tests/test_api.py` and
+`tests/test_frontend.py` both import the API app.)
 
 Tests run against a synthetic, fabricated fixture generated on the fly
 (`tests/fixtures/synthetic_scan.py`) — never real scanned documents, which
