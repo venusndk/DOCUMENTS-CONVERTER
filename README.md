@@ -114,6 +114,35 @@ through the real file input, clicks the real button, and confirms a real
 file downloads with correct data — the same standard as every other
 end-to-end test in this project.
 
+### Status colors (Phase 10)
+
+The page's one status display (`#status`) uses a centralized semantic
+color system, defined once as CSS custom properties in `index.html` and
+reused by three status classes (`.processing`, `.success`, `.error`) —
+not hardcoded per state, and not named after what they look like:
+
+| Meaning              | Class          | Color     |
+|----------------------|----------------|-----------|
+| Uploading/converting  | `.processing` | `#F59E0B` (amber) |
+| Completed             | `.success`    | `#22C55E` (green) |
+| Failed                | `.error`      | `#EF4444` (red)   |
+| Idle/not started      | *(none — box is hidden)* | `#64748B` reserved for a future visible idle badge |
+
+Color is never the only signal: `setStatus()` in the page's script
+prepends a fixed icon per state (⟳ / ✓ / ✕) to the actual text, and
+`#status` carries `role="status" aria-live="polite"` so a screen reader
+announces the change too. Verified for WCAG AA contrast (≥4.5:1) in both
+light mode and the page's `prefers-color-scheme: dark` variant — the page
+had no dark theme before this phase; adding the semantic tokens as
+light/dark pairs made supporting one straightforward, so the rest of the
+page (background, card, borders, inputs) picked up a dark variant too.
+
+Known limitation: this is the only status display in the app today,
+so "consistent everywhere" currently means "consistent in the one place
+it appears." A job-history list, per-file badges, or an admin dashboard
+would reuse the same three classes/tokens rather than introduce new
+colors, but none of those surfaces exist in this project yet.
+
 Known limitation: the page always submits to the default `target`
 (OCR→Excel) — it doesn't yet expose the other conversions the registry
 below knows about (e.g. image→PDF). Reaching those currently means
