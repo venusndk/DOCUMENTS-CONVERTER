@@ -36,18 +36,21 @@ documents_converter/
         rate_limit.py                per-IP fixed-window rate limiter
         auth.py                      API-key authentication
         jobs.py                      in-memory async job store
+        audit.py                     structured audit trail (Phase 11)
         static/index.html            the web page -- upload, convert, download
 tests/
     conftest.py
     test_ocr_excel.py                 pipeline/provider regression tests
     test_registry.py                   capability registry unit tests
     test_api.py                        API tests
+    test_audit.py                      audit trail + startup-guard unit tests
     test_frontend.py                   real-browser (Playwright) frontend tests
     fixtures/synthetic_scan.py        generates a fabricated (no real data) test PDF
 docs/
     PHASE_0_AUDIT.md                  current-state audit, capability matrix, phase plan
 .github/workflows/test.yml            CI: runs the test suite on every push/PR
-Dockerfile                            containerizes the API (not the CLI)
+Dockerfile                            containerizes the API (not the CLI), non-root + healthcheck
+LICENSE                                MIT (Phase 11)
 ```
 
 `documents_converter/ocr_excel.py` orchestrates the pipeline and calls into
@@ -252,7 +255,8 @@ Configuration (environment variables, see `documents_converter/api/config.py`):
 (default: 50), `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS`
 (default: 10 requests per 60s per client IP), `CONVERT_TIMEOUT_SECONDS`
 (default: 180), `JOB_RETENTION_SECONDS` (default: 3600), `API_KEYS`
-(default: empty, i.e. auth off — see below).
+(default: empty, i.e. auth off — see below), `ENVIRONMENT` and
+`AUDIT_LOG_PATH` (Phase 11, see Security hardening below).
 
 ### Authentication
 
@@ -275,6 +279,16 @@ yet, and building one before there's an actual need for per-user data
 (history, usage billing) would repeat exactly the kind of premature
 infrastructure `docs/PHASE_0_AUDIT.md` warns against. A real identity
 system is a reasonable later phase once that need exists.
+
+**Production startup guard (Phase 11):** set `ENVIRONMENT=production` and
+the app refuses to start at all if `API_KEYS` is still empty — a real
+hosted deployment shouldn't be able to go live unauthenticated just
+because someone forgot to set a key. `ENVIRONMENT` defaults to
+`development`, where this check never blocks startup, so a fresh local
+checkout keeps working with zero configuration. Verified against a real
+container: `ENVIRONMENT=production` with no `API_KEYS` set exits
+immediately (checked its actual exit code, not just the log output);
+the same environment with a key set starts normally and enforces it.
 
 ### Security hardening
 
@@ -300,6 +314,19 @@ naming, no document-content logging), the API also has:
 - **No leaked stack traces** — a catch-all exception handler guarantees
   any unexpected error returns a generic message, regardless of what
   actually went wrong.
+- **Production startup guard** (Phase 11) — see Authentication above.
+- **Audit trail** (Phase 11, `documents_converter/api/audit.py`) — every
+  conversion attempt (`/convert` and `/jobs`) writes a structured JSON-line
+  record: timestamp, request/job id, source extension, target format,
+  size, client IP, whether auth was enforced, and success/failure with a
+  reason category and duration. Always to stdout; also to a file if
+  `AUDIT_LOG_PATH` is set (e.g. on a mounted volume), for a deployment
+  that wants that record to outlive the container without a database.
+  Never the document's content or client-supplied filename, same policy
+  as every other log line in this project. This exists specifically
+  because the README elsewhere describes this service handling "trusted
+  official documents" — that claim needs *some* durable record of who
+  converted what and when, not just ephemeral debug prints.
 
 Combined with the Authentication section above, the API is now closer to
 suitable for untrusted traffic — the main remaining gap is the rate
@@ -322,6 +349,12 @@ since the Linux `apt` Tesseract build reads faint empty-cell artifacts a
 little differently than the Windows build used elsewhere in this project;
 that's cosmetic, not a correctness issue (see the Accuracy & trust report
 below on this class of noise generally).
+
+The container runs as an unprivileged user (`appuser`, Phase 11) rather
+than root — confirmed with `docker exec ... whoami` against a real running
+container, not just read from the Dockerfile — and declares a
+`HEALTHCHECK` against `/health` so an orchestrator can detect a wedged
+container, not only a crashed one.
 
 ## Continuous integration
 
@@ -503,3 +536,9 @@ headers — an LLM-vision approach (sending the page image to a vision-capable
 model and asking for structured JSON, then loading that into pandas) may do
 better than Tesseract in some cases, at the cost of per-document API calls
 and its own, different failure modes. Not built into this script.
+
+## License
+
+[MIT](LICENSE) — chosen as a standard, permissive default (Phase 11);
+swap it for something else if your institution needs different terms
+before this is exposed publicly.
