@@ -22,6 +22,20 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements-api.txt
 # CLI's own dev-only files.
 COPY documents_converter/ documents_converter/
 
+# Phase 11 (docs/PHASE_0_AUDIT.md numbering continued): run as an
+# unprivileged user rather than the container default (root). The app
+# never needs root -- it only reads its own code and writes to per-request
+# temp directories (Python's tempfile module defaults to a world-writable
+# /tmp, which appuser can use without owning /app).
+RUN useradd --create-home --shell /usr/sbin/nologin appuser
+USER appuser
+
 EXPOSE 8000
+
+# Lets an orchestrator (docker compose, k8s, etc.) detect a wedged
+# container instead of only a crashed one -- hits the same unauthenticated
+# liveness endpoint real monitoring would (see documents_converter/api/app.py).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)" || exit 1
 
 CMD ["uvicorn", "documents_converter.api.app:app", "--host", "0.0.0.0", "--port", "8000"]

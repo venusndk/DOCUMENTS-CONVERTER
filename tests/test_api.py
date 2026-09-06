@@ -18,6 +18,8 @@ see the fix commit for the full story.
 """
 
 import io
+import json
+import logging
 import time
 import zipfile
 
@@ -493,3 +495,70 @@ def test_job_image_to_pdf_end_to_end():
         assert doc.page_count == 1
     finally:
         doc.close()
+
+
+# --------------------------------------------------------------------------
+# Phase 11: audit trail (documents_converter/api/audit.py). Uses the
+# OCR-free image->pdf capability rather than the OCR pipeline -- these
+# tests are about whether the right audit events fire, not about OCR
+# accuracy, so there's no reason to pay for a slow real OCR run here.
+# --------------------------------------------------------------------------
+
+
+def _audit_events(caplog) -> list[dict]:
+    return [
+        json.loads(r.message)
+        for r in caplog.records
+        if r.name == "documents_converter.audit"
+    ]
+
+
+def test_convert_emits_requested_and_completed_audit_events(caplog):
+    with caplog.at_level(logging.INFO, logger="documents_converter.audit"):
+        resp = client.post(
+            "/api/v1/convert",
+            data={"target": "pdf"},
+            files={"file": ("photo.png", io.BytesIO(_sample_png_bytes()), "image/png")},
+        )
+    assert resp.status_code == 200
+
+    events = _audit_events(caplog)
+    kinds = [e["event"] for e in events]
+    assert kinds == ["convert_requested", "convert_completed"]
+    assert events[0]["ext"] == ".png"
+    assert events[0]["target_format"] == "pdf"
+    assert events[0]["source_format"] == "image"
+    assert "client_ip" in events[0]
+    assert events[0]["request_id"] == events[1]["request_id"]
+    assert isinstance(events[1]["duration_ms"], int)
+
+
+def test_convert_emits_failed_audit_event_on_rejected_upload(caplog):
+    with caplog.at_level(logging.INFO, logger="documents_converter.audit"):
+        resp = client.post("/api/v1/convert", files=_junk_file)
+    assert resp.status_code == 400
+
+    # Rejected before a capability is even resolved (Unsupported file
+    # type) -- no audit event at all, since there's no real attempted
+    # conversion to record yet. Confirms the earlier validation failure
+    # doesn't silently masquerade as a recorded conversion attempt.
+    assert _audit_events(caplog) == []
+
+
+def test_job_emits_created_and_completed_audit_events(caplog):
+    with caplog.at_level(logging.INFO, logger="documents_converter.audit"):
+        resp = client.post(
+            "/api/v1/jobs",
+            data={"target": "pdf"},
+            files={"file": ("photo.png", io.BytesIO(_sample_png_bytes()), "image/png")},
+        )
+        assert resp.status_code == 202
+        job_id = resp.json()["job_id"]
+        status = _wait_for_job_terminal(job_id)
+        assert status == "completed"
+
+    events = _audit_events(caplog)
+    kinds = [e["event"] for e in events]
+    assert kinds == ["job_created", "job_completed"]
+    assert events[0]["job_id"] == job_id == events[1]["job_id"]
+    assert events[0]["endpoint"] == "async"

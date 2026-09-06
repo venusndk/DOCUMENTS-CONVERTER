@@ -37,6 +37,13 @@ do", routed by an optional `target` field that defaults to "xlsx" so
 every existing caller keeps working unchanged. See GET
 /api/v1/capabilities for what's registered.
 
+Phase 11 added two production-readiness pieces: a startup guard
+(_check_startup_config) that refuses to run unauthenticated in
+ENVIRONMENT=production, and a structured audit trail (audit.py) recording
+who converted what kind of file to what target and whether it succeeded
+-- separate from the ad-hoc print() logging already used for request
+diagnostics throughout this file.
+
 Run locally:
     uvicorn documents_converter.api.app:app --reload
 """
@@ -45,9 +52,11 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
@@ -56,7 +65,7 @@ from PIL import Image as PILImage
 
 import fitz
 
-from . import config, security
+from . import audit, config, security
 from .auth import require_api_key
 from .jobs import Job, JobStore
 from .rate_limit import FixedWindowRateLimiter
@@ -64,7 +73,42 @@ from .. import converters  # noqa: F401 -- import for its registration side effe
 from ..ocr_excel import check_tesseract_available
 from ..registry import Capability, registry
 
-app = FastAPI(title="Documents Converter API", version="0.1.0")
+
+def _check_startup_config() -> None:
+    """
+    Fails fast if this process is about to serve /api/v1/* unauthenticated
+    in production (config.ENVIRONMENT == "production" and no API_KEYS
+    configured) -- a real hosted deployment of this service should not be
+    able to go live open-to-anyone by omission. Does nothing in the
+    "development" default, so a fresh local checkout keeps working with
+    zero configuration.
+
+    A plain function, not inlined in the lifespan handler below, so it's
+    directly unit-testable (documents_converter.api.app._check_startup_config)
+    without depending on how faithfully a given ASGI test client emulates
+    lifespan events.
+    """
+    if config.ENVIRONMENT == "production" and not config.API_KEYS:
+        raise RuntimeError(
+            "ENVIRONMENT=production but API_KEYS is not set -- refusing to start "
+            "unauthenticated in production. Set API_KEYS (see config.py), or set "
+            "ENVIRONMENT=development for local/trusted-network use only."
+        )
+    if not config.API_KEYS:
+        print(
+            "[startup] WARNING: API_KEYS is not set -- every /api/v1/* route is "
+            "unauthenticated. Fine for local development; set API_KEYS before "
+            "exposing this service beyond a trusted network."
+        )
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    _check_startup_config()
+    yield
+
+
+app = FastAPI(title="Documents Converter API", version="0.1.0", lifespan=_lifespan)
 
 _rate_limiter = FixedWindowRateLimiter(
     max_requests=config.RATE_LIMIT_MAX_REQUESTS,
@@ -156,9 +200,15 @@ def _resolve_capability(ext: str, target: str) -> Capability:
     return capability
 
 
+def _client_ip(request: Request) -> str:
+    """Shared by rate limiting and the audit log below -- the closest
+    thing to "who" this service can identify today, since there's no
+    user-account system yet (see auth.py's own docstring)."""
+    return request.client.host if request.client else "unknown"
+
+
 def _check_rate_limit(request: Request) -> None:
-    client_ip = request.client.host if request.client else "unknown"
-    if not _rate_limiter.allow(client_ip):
+    if not _rate_limiter.allow(_client_ip(request)):
         raise HTTPException(status_code=429, detail="Too many requests. Please slow down.")
 
 
@@ -249,13 +299,34 @@ def convert(request: Request, file: UploadFile, target: str = Form("xlsx")) -> R
         output_path = Path(tmp_dir) / f"output{capability.output_extension}"
 
         request_id = uuid.uuid4().hex[:12]
+        size_bytes = input_path.stat().st_size
         # Safe metadata only (docs/PHASE_0_AUDIT.md: never log document
         # contents) -- extension and size, not the client-supplied filename
         # or anything read from inside the file.
         print(
             f"[{request_id}] convert request: ext={ext} target={target} "
-            f"size={input_path.stat().st_size}B"
+            f"size={size_bytes}B"
         )
+        audit.log_event(
+            "convert_requested",
+            request_id=request_id,
+            endpoint="sync",
+            source_format=capability.source_format,
+            target_format=capability.target_format,
+            ext=ext,
+            size_bytes=size_bytes,
+            client_ip=_client_ip(request),
+            auth_enforced=bool(config.API_KEYS),
+        )
+        start_time = time.monotonic()
+
+        def _failed(reason: str) -> None:
+            audit.log_event(
+                "convert_failed",
+                request_id=request_id,
+                reason=reason,
+                duration_ms=int((time.monotonic() - start_time) * 1000),
+            )
 
         try:
             _check_decompression_bomb(input_path, ext)
@@ -267,8 +338,10 @@ def convert(request: Request, file: UploadFile, target: str = Form("xlsx")) -> R
             )
             future.result(timeout=config.CONVERT_TIMEOUT_SECONDS)
         except security.FileTooLargeError as e:
+            _failed("file_too_large")
             raise HTTPException(status_code=413, detail=str(e)) from e
         except FutureTimeoutError as e:
+            _failed("timeout")
             raise HTTPException(
                 status_code=504,
                 detail=f"Conversion exceeded {config.CONVERT_TIMEOUT_SECONDS:.0f}s and was abandoned.",
@@ -276,6 +349,7 @@ def convert(request: Request, file: UploadFile, target: str = Form("xlsx")) -> R
         except EnvironmentError as e:
             # Tesseract missing/misconfigured -- a server problem, not a
             # bad request.
+            _failed("environment_error")
             raise HTTPException(status_code=503, detail=str(e)) from e
         except Exception as e:
             # Per docs/PHASE_0_AUDIT.md failure philosophy: never expose a
@@ -283,11 +357,17 @@ def convert(request: Request, file: UploadFile, target: str = Form("xlsx")) -> R
             # (safe: this is a pipeline error, not document content) and
             # return a generic message.
             print(f"[{request_id}] conversion failed: {e!r}")
+            _failed("internal_error")
             raise HTTPException(
                 status_code=500,
                 detail="Conversion failed. This has been logged for investigation.",
             ) from e
 
+        audit.log_event(
+            "convert_completed",
+            request_id=request_id,
+            duration_ms=int((time.monotonic() - start_time) * 1000),
+        )
         result_bytes = output_path.read_bytes()
 
     return Response(
@@ -305,6 +385,17 @@ def _run_job(
     """Runs on the shared executor, in the background -- the HTTP request
     that created this job has already returned by the time this runs."""
     _job_store.update(job.id, status="processing")
+    start_time = time.monotonic()
+
+    def _failed(reason: str) -> None:
+        audit.log_event(
+            "job_failed",
+            request_id=request_id,
+            job_id=job.id,
+            reason=reason,
+            duration_ms=int((time.monotonic() - start_time) * 1000),
+        )
+
     try:
         _check_decompression_bomb(input_path, ext)
         capability.convert(
@@ -313,10 +404,18 @@ def _run_job(
             progress=lambda msg: print(f"[{request_id}] {msg}"),
         )
         _job_store.update(job.id, status="completed", result_path=output_path)
+        audit.log_event(
+            "job_completed",
+            request_id=request_id,
+            job_id=job.id,
+            duration_ms=int((time.monotonic() - start_time) * 1000),
+        )
     except security.FileTooLargeError as e:
         _job_store.update(job.id, status="failed", error=str(e))
+        _failed("file_too_large")
     except EnvironmentError as e:
         _job_store.update(job.id, status="failed", error=str(e))
+        _failed("environment_error")
     except Exception as e:
         # Same failure philosophy as the sync endpoint: log the real error
         # server-side, expose only a generic message via the status endpoint.
@@ -324,6 +423,7 @@ def _run_job(
         _job_store.update(
             job.id, status="failed", error="Conversion failed. This has been logged for investigation."
         )
+        _failed("internal_error")
 
 
 @app.post("/api/v1/jobs", dependencies=[Depends(require_api_key)], status_code=202)
@@ -360,9 +460,22 @@ def create_job(request: Request, file: UploadFile, target: str = Form("xlsx")) -
         result_filename=f"converted{capability.output_extension}",
     )
     request_id = uuid.uuid4().hex[:12]
+    size_bytes = input_path.stat().st_size
     print(
         f"[{request_id}] job {job.id} queued: ext={ext} target={target} "
-        f"size={input_path.stat().st_size}B"
+        f"size={size_bytes}B"
+    )
+    audit.log_event(
+        "job_created",
+        request_id=request_id,
+        job_id=job.id,
+        endpoint="async",
+        source_format=capability.source_format,
+        target_format=capability.target_format,
+        ext=ext,
+        size_bytes=size_bytes,
+        client_ip=_client_ip(request),
+        auth_enforced=bool(config.API_KEYS),
     )
 
     _convert_executor.submit(_run_job, job, input_path, output_path, ext, capability, request_id)

@@ -48,3 +48,20 @@ CONVERT_TIMEOUT_SECONDS: float = float(os.environ.get("CONVERT_TIMEOUT_SECONDS",
 # (completed or failed) job's result stays downloadable before its temp
 # files are cleaned up.
 JOB_RETENTION_SECONDS: float = float(os.environ.get("JOB_RETENTION_SECONDS", "3600"))
+
+# Phase 11 (docs/PHASE_0_AUDIT.md numbering continued): production
+# readiness. "development" (the default) never blocks startup no matter
+# how it's configured -- a fresh local checkout must keep working with
+# zero setup. Set to "production" to make app.py refuse to start with
+# auth off (see app._check_startup_config): a real hosted deployment of
+# this service (per the project's own stated direction -- see README)
+# should not be able to go live unauthenticated by omission.
+ENVIRONMENT: str = os.environ.get("ENVIRONMENT", "development")
+
+# Phase 11: minimal audit trail (documents_converter/api/audit.py). Unset
+# by default -- the audit log always goes to stdout regardless (captured
+# by whatever log aggregation a real deployment already has); set this to
+# also append it to a file, e.g. on a mounted volume, for a deployment
+# that wants that record to outlive the container without standing up a
+# database just for this.
+AUDIT_LOG_PATH: str | None = os.environ.get("AUDIT_LOG_PATH") or None
