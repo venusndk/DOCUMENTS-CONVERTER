@@ -36,8 +36,10 @@ def matches_magic_bytes(ext: str, header: bytes) -> bool:
     :param ext: lowercased extension including the dot, e.g. ".pdf"
     :param header: the first MAGIC_BYTES_TO_READ bytes of the file
     :return: True if the content matches a known signature for `ext`, or
-        if `ext` has no registered signature (callers should already be
-        rejecting unknown extensions via an allowlist before this runs)
+        if `ext` has no registered signature (callers should reject an
+        unsupported extension -- e.g. via the capability registry,
+        documents_converter/registry.py -- before acting on the file
+        this validates)
     """
     sigs = MAGIC_SIGNATURES.get(ext)
     if not sigs:

@@ -21,6 +21,14 @@ documents_converter/
         table_detection.py           TableDetector: per-page bordered/borderless
                                       mode selection, img2table extraction, and
                                       the grid-line-detection fallback
+    registry.py                      Format & Capability Registry -- the single
+                                      source of truth for which (source format ->
+                                      target format) conversions this service can
+                                      do, and what performs each one
+    converters/                      one module per registered Capability
+        ocr_to_excel.py               wraps the OCR pipeline above as a Capability
+        image_to_pdf.py               image -> PDF (no OCR) -- the proof that the
+                                      registry isn't OCR-only
     api/
         app.py                       minimal synchronous HTTP API (see below)
         config.py                    environment-based API configuration
@@ -32,6 +40,7 @@ documents_converter/
 tests/
     conftest.py
     test_ocr_excel.py                 pipeline/provider regression tests
+    test_registry.py                   capability registry unit tests
     test_api.py                        API tests
     test_frontend.py                   real-browser (Playwright) frontend tests
     fixtures/synthetic_scan.py        generates a fabricated (no real data) test PDF
@@ -105,9 +114,44 @@ through the real file input, clicks the real button, and confirms a real
 file downloads with correct data — the same standard as every other
 end-to-end test in this project.
 
+Known limitation: the page always submits to the default `target`
+(OCR→Excel) — it doesn't yet expose the other conversions the registry
+below knows about (e.g. image→PDF). Reaching those currently means
+calling the API directly with an explicit `target` field.
+
+## Format & capability registry
+
+`documents_converter/registry.py` is the single source of truth for which
+(source format → target format) conversions this service can perform, and
+what actually performs each one — added so a new conversion plugs in
+without hardcoding another special case into the API layer (`if ext ==
+".pdf" and target == "xlsx": ... elif ...`, which only gets worse with
+every conversion after the first). Both `/api/v1/convert` and
+`/api/v1/jobs` route through it via an optional `target` field.
+
+Two capabilities are registered today:
+
+| source format      | target | accepts                                    | what it does                          |
+|---------------------|--------|---------------------------------------------|----------------------------------------|
+| `scanned_document`   | `xlsx` | `.pdf .png .jpg .jpeg .tiff .tif .bmp`      | the OCR + table-detection pipeline above |
+| `image`              | `pdf`  | `.png .jpg .jpeg .tiff .tif .bmp`           | plain image → single-page PDF, no OCR  |
+
+`GET /api/v1/capabilities` reports this list live, from the registry
+itself, so it can't drift out of sync with what the server actually does:
+
+```powershell
+curl.exe http://127.0.0.1:8000/api/v1/capabilities
+```
+
+Adding a new conversion means writing one new module under
+`documents_converter/converters/` exposing a `Capability` and registering
+it in that package's `__init__.py` — nothing in `app.py`'s routing logic
+needs to change, since it only ever asks the registry "what handles this
+(extension, target) pair?" (`registry.find`, used by `app._resolve_capability`).
+
 ## HTTP API (optional)
 
-An API wraps the same engine, for anything that needs to call this over
+An API wraps the registry above, for anything that needs to call this over
 HTTP instead of the CLI (the web page above is itself just a client of
 it). Two ways to call it:
 
@@ -121,24 +165,34 @@ uvicorn documents_converter.api.app:app --reload
 
 ```
 GET  /health                    -> {"status": "ok", "tesseract_available": true}
+GET  /api/v1/capabilities       -> what conversions are registered (see above)
 
 POST /api/v1/convert            -> synchronous: upload a file (multipart/form-data,
-                                    field name "file"), the response IS the finished
-                                    .xlsx. Simplest option; the connection stays open
-                                    for the whole conversion.
+                                    field name "file") and optionally "target" (a
+                                    target format from /api/v1/capabilities; defaults
+                                    to "xlsx"). The response IS the finished file.
+                                    Simplest option; the connection stays open for
+                                    the whole conversion.
 
-POST /api/v1/jobs                -> async: upload a file, get back
-                                    {"job_id": "...", "status": "queued"} immediately
-                                    (202). The conversion runs in the background.
+POST /api/v1/jobs                -> async: same fields ("file", optional "target"),
+                                    get back {"job_id": "...", "status": "queued"}
+                                    immediately (202). The conversion runs in the
+                                    background.
 GET  /api/v1/jobs/{id}           -> {"job_id": "...", "status": "queued|processing|
                                     completed|failed", "error": "..." (if failed)}
-GET  /api/v1/jobs/{id}/result    -> the finished .xlsx, once status is "completed"
-                                    (409 otherwise)
+GET  /api/v1/jobs/{id}/result    -> the finished file, once status is "completed"
+                                    (409 otherwise) -- Content-Type and filename
+                                    extension match whichever capability ran.
 ```
 
-Synchronous example:
+Synchronous example (defaults to the OCR->Excel capability):
 ```powershell
 curl.exe -F "file=@transcript.pdf" http://127.0.0.1:8000/api/v1/convert -o result.xlsx
+```
+
+Synchronous example, a different target (the image->pdf capability):
+```powershell
+curl.exe -F "target=pdf" -F "file=@photo.png" http://127.0.0.1:8000/api/v1/convert -o result.pdf
 ```
 
 Async example:

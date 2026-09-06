@@ -30,6 +30,13 @@ local/dev use needs no extra setup. /health stays unauthenticated on
 purpose: load balancers and monitoring probes need to reach it without
 credentials.
 
+Phase 9 (docs/PHASE_0_AUDIT.md numbering continued) generalized both
+/api/v1/convert and /api/v1/jobs from "always OCR->Excel" to "whatever
+the capability registry (documents_converter/registry.py) knows how to
+do", routed by an optional `target` field that defaults to "xlsx" so
+every existing caller keeps working unchanged. See GET
+/api/v1/capabilities for what's registered.
+
 Run locally:
     uvicorn documents_converter.api.app:app --reload
 """
@@ -43,7 +50,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from PIL import Image as PILImage
 
@@ -53,7 +60,9 @@ from . import config, security
 from .auth import require_api_key
 from .jobs import Job, JobStore
 from .rate_limit import FixedWindowRateLimiter
-from ..ocr_excel import check_tesseract_available, convert_scanned_to_excel
+from .. import converters  # noqa: F401 -- import for its registration side effect only
+from ..ocr_excel import check_tesseract_available
+from ..registry import Capability, registry
 
 app = FastAPI(title="Documents Converter API", version="0.1.0")
 
@@ -69,7 +78,6 @@ _job_store = JobStore(retention_seconds=config.JOB_RETENTION_SECONDS)
 # it finishes on its own, it's just no longer waited on).
 _convert_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="convert")
 
-XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _STATIC_DIR = Path(__file__).parent / "static"
 
 
@@ -103,6 +111,51 @@ def health() -> dict:
     }
 
 
+@app.get("/api/v1/capabilities")
+def list_capabilities() -> list[dict]:
+    """
+    Discovery endpoint over the capability registry (Phase 9,
+    documents_converter/registry.py): what conversions this server can
+    perform right now, and which file extensions/target format each one
+    accepts. Unauthenticated like /health -- it's metadata about the
+    service, not a document operation, so it carries no more risk than
+    reading the API docs.
+    """
+    return [
+        {
+            "source_format": c.source_format,
+            "target_format": c.target_format,
+            "description": c.description,
+            "accepted_extensions": sorted(c.source_extensions),
+        }
+        for c in registry.list_all()
+    ]
+
+
+def _resolve_capability(ext: str, target: str) -> Capability:
+    """Shared by both /convert and /jobs: turns (uploaded file's
+    extension, requested target format) into the Capability that
+    handles it, or a clear 400 if nothing matches. This is what replaced
+    the old hardcoded `ext not in config.ALLOWED_EXTENSIONS` check --
+    "allowed" is now whatever the registry says it can route, not a
+    single global list."""
+    try:
+        capability = registry.find(target, ext)
+    except ValueError as e:
+        # Ambiguous registration -- a bug in this service's own setup,
+        # not the caller's fault, but still safer to report as a clean
+        # error than to 500.
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    if capability is None:
+        known_targets = sorted({c.target_format for c in registry.list_all()})
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}' for target '{target}'. "
+            f"Known target formats: {known_targets}. See GET /api/v1/capabilities.",
+        )
+    return capability
+
+
 def _check_rate_limit(request: Request) -> None:
     client_ip = request.client.host if request.client else "unknown"
     if not _rate_limiter.allow(client_ip):
@@ -111,18 +164,19 @@ def _check_rate_limit(request: Request) -> None:
 
 def _validate_and_save_upload(request: Request, file: UploadFile, work_dir: Path) -> tuple[Path, str]:
     """
-    Shared by both the sync and async endpoints: validates the extension,
-    upload size, and magic-byte signature while streaming the upload to
-    `work_dir`. Raises HTTPException on any validation failure.
+    Shared by both the sync and async endpoints: validates upload size and
+    magic-byte signature while streaming the upload to `work_dir`. Raises
+    HTTPException on any validation failure.
+
+    Does NOT gate on a fixed extension allowlist -- since Phase 9
+    (documents_converter/registry.py) that job belongs to
+    _resolve_capability, called separately by each endpoint once it also
+    knows the requested target format. This function only extracts the
+    extension and checks that the file's actual bytes match what it
+    claims to be.
     :return: (input_path, ext)
     """
     ext = Path(file.filename or "").suffix.lower()
-    if ext not in config.ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type '{ext}'. Allowed: "
-            f"{sorted(config.ALLOWED_EXTENSIONS)}",
-        )
 
     max_bytes = config.MAX_UPLOAD_MB * 1024 * 1024
     # Cheap early rejection before reading any of the body. Content-Length
@@ -176,31 +230,39 @@ def _check_decompression_bomb(input_path: Path, ext: str) -> None:
 
 
 @app.post("/api/v1/convert", dependencies=[Depends(require_api_key)])
-def convert(request: Request, file: UploadFile) -> Response:
+def convert(request: Request, file: UploadFile, target: str = Form("xlsx")) -> Response:
     """
-    Accepts one scanned PDF or image, returns the extracted table(s) as an
-    .xlsx file. Synchronous: the response is the finished file, not a job
-    reference. See /api/v1/jobs for the async alternative.
+    Accepts one file and returns the converted result. `target` selects
+    which registered capability handles it (documents_converter/registry.py)
+    and defaults to "xlsx" -- the original scanned-document-to-Excel
+    pipeline every caller before Phase 9 already relies on -- so existing
+    callers that never send `target` keep getting exactly the same
+    behavior. Synchronous: the response is the finished file, not a job
+    reference. See /api/v1/jobs for the async alternative, and GET
+    /api/v1/capabilities for what `target` values are available.
     """
     _check_rate_limit(request)
 
     with tempfile.TemporaryDirectory(prefix="docconv-") as tmp_dir:
         input_path, ext = _validate_and_save_upload(request, file, Path(tmp_dir))
-        output_path = Path(tmp_dir) / "output.xlsx"
+        capability = _resolve_capability(ext, target)
+        output_path = Path(tmp_dir) / f"output{capability.output_extension}"
 
         request_id = uuid.uuid4().hex[:12]
         # Safe metadata only (docs/PHASE_0_AUDIT.md: never log document
         # contents) -- extension and size, not the client-supplied filename
         # or anything read from inside the file.
-        print(f"[{request_id}] convert request: ext={ext} size={input_path.stat().st_size}B")
+        print(
+            f"[{request_id}] convert request: ext={ext} target={target} "
+            f"size={input_path.stat().st_size}B"
+        )
 
         try:
             _check_decompression_bomb(input_path, ext)
             future = _convert_executor.submit(
-                convert_scanned_to_excel,
-                file_path=str(input_path),
-                output_excel_path=str(output_path),
-                tesseract_cmd=config.TESSERACT_CMD,
+                capability.convert,
+                input_path,
+                output_path,
                 progress=lambda msg: print(f"[{request_id}] {msg}"),
             )
             future.result(timeout=config.CONVERT_TIMEOUT_SECONDS)
@@ -226,25 +288,28 @@ def convert(request: Request, file: UploadFile) -> Response:
                 detail="Conversion failed. This has been logged for investigation.",
             ) from e
 
-        xlsx_bytes = output_path.read_bytes()
+        result_bytes = output_path.read_bytes()
 
     return Response(
-        content=xlsx_bytes,
-        media_type=XLSX_MEDIA_TYPE,
-        headers={"Content-Disposition": "attachment; filename=converted.xlsx"},
+        content=result_bytes,
+        media_type=capability.media_type,
+        headers={
+            "Content-Disposition": f"attachment; filename=converted{capability.output_extension}"
+        },
     )
 
 
-def _run_job(job: Job, input_path: Path, output_path: Path, ext: str, request_id: str) -> None:
+def _run_job(
+    job: Job, input_path: Path, output_path: Path, ext: str, capability: Capability, request_id: str
+) -> None:
     """Runs on the shared executor, in the background -- the HTTP request
     that created this job has already returned by the time this runs."""
     _job_store.update(job.id, status="processing")
     try:
         _check_decompression_bomb(input_path, ext)
-        convert_scanned_to_excel(
-            file_path=str(input_path),
-            output_excel_path=str(output_path),
-            tesseract_cmd=config.TESSERACT_CMD,
+        capability.convert(
+            input_path,
+            output_path,
             progress=lambda msg: print(f"[{request_id}] {msg}"),
         )
         _job_store.update(job.id, status="completed", result_path=output_path)
@@ -262,12 +327,13 @@ def _run_job(job: Job, input_path: Path, output_path: Path, ext: str, request_id
 
 
 @app.post("/api/v1/jobs", dependencies=[Depends(require_api_key)], status_code=202)
-def create_job(request: Request, file: UploadFile) -> dict:
+def create_job(request: Request, file: UploadFile, target: str = Form("xlsx")) -> dict:
     """
-    Accepts one scanned PDF or image, validates it synchronously (so bad
-    input is rejected immediately, not discovered later by polling), then
-    queues the actual OCR conversion in the background and returns right
-    away with a job id to poll.
+    Accepts one file, validates it synchronously (so bad input is rejected
+    immediately, not discovered later by polling), then queues the actual
+    conversion in the background and returns right away with a job id to
+    poll. `target` selects the capability, same as /api/v1/convert -- see
+    that endpoint's docstring and GET /api/v1/capabilities.
     """
     _check_rate_limit(request)
 
@@ -277,6 +343,7 @@ def create_job(request: Request, file: UploadFile) -> dict:
 
     try:
         input_path, ext = _validate_and_save_upload(request, file, work_dir)
+        capability = _resolve_capability(ext, target)
         _check_decompression_bomb(input_path, ext)
     except HTTPException:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -286,11 +353,19 @@ def create_job(request: Request, file: UploadFile) -> dict:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise HTTPException(status_code=413, detail=str(e)) from e
 
-    output_path = work_dir / "output.xlsx"
+    output_path = work_dir / f"output{capability.output_extension}"
+    _job_store.update(
+        job.id,
+        result_media_type=capability.media_type,
+        result_filename=f"converted{capability.output_extension}",
+    )
     request_id = uuid.uuid4().hex[:12]
-    print(f"[{request_id}] job {job.id} queued: ext={ext} size={input_path.stat().st_size}B")
+    print(
+        f"[{request_id}] job {job.id} queued: ext={ext} target={target} "
+        f"size={input_path.stat().st_size}B"
+    )
 
-    _convert_executor.submit(_run_job, job, input_path, output_path, ext, request_id)
+    _convert_executor.submit(_run_job, job, input_path, output_path, ext, capability, request_id)
 
     return {"job_id": job.id, "status": job.status}
 
@@ -317,8 +392,8 @@ def get_job_result(job_id: str) -> Response:
         )
     return Response(
         content=job.result_path.read_bytes(),
-        media_type=XLSX_MEDIA_TYPE,
-        headers={"Content-Disposition": "attachment; filename=converted.xlsx"},
+        media_type=job.result_media_type,
+        headers={"Content-Disposition": f"attachment; filename={job.result_filename}"},
     )
 
 

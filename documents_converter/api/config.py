@@ -18,10 +18,12 @@ TESSERACT_CMD: str | None = os.environ.get("TESSERACT_CMD") or None
 # Reject uploads above this size before doing any processing work.
 MAX_UPLOAD_MB: int = int(os.environ.get("MAX_UPLOAD_MB", "50"))
 
-# Extensions accepted for upload. Matches ocr_excel.IMAGE_EXTENSIONS plus PDF.
-ALLOWED_EXTENSIONS: frozenset[str] = frozenset(
-    {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
-)
+# Which extensions are accepted for upload used to be a fixed list here.
+# Phase 9 replaced it: what's "allowed" now depends on which target format
+# the caller asked for, answered by the capability registry
+# (documents_converter/registry.py, routed via app.py's
+# _resolve_capability) instead of one global set -- see GET
+# /api/v1/capabilities for the live answer.
 
 # Phase 6 (docs/PHASE_0_AUDIT.md): API-key auth. Comma-separated list of
 # accepted keys. Empty by default -- auth is OFF until at least one key is
