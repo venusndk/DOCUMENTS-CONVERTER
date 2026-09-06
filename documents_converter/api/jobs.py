@@ -30,6 +30,13 @@ class Job:
     created_at: float = field(default_factory=time.time)
     error: str | None = None
     result_path: Path | None = None
+    # Set from the resolved Capability when the job is created (Phase 9:
+    # documents_converter/registry.py) so /result can serve the right
+    # Content-Type/filename for whatever conversion actually ran, instead
+    # of the xlsx-only response every job produced before the registry
+    # existed.
+    result_media_type: str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    result_filename: str = "converted.xlsx"
     # The job's own temp directory (holds input + output). Owned by the
     # job, not auto-cleaned on scope exit like the sync endpoint's -- a
     # job may be polled and its result downloaded well after the request

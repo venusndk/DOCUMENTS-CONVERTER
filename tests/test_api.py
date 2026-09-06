@@ -21,9 +21,11 @@ import io
 import time
 import zipfile
 
+import fitz
 import openpyxl
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from documents_converter.api import config, security
 from documents_converter.api.app import _rate_limiter, app
@@ -31,6 +33,15 @@ from documents_converter.api.app import _rate_limiter, app
 from conftest import requires_tesseract
 
 client = TestClient(app)
+
+
+def _sample_png_bytes() -> bytes:
+    """A tiny, real, valid PNG -- not a synthetic scan (no OCR involved in
+    the image->pdf conversion these tests exercise), just something real
+    enough that Pillow's own decoder and encoder both accept it."""
+    buf = io.BytesIO()
+    Image.new("RGB", (40, 30), color=(200, 60, 60)).save(buf, "PNG")
+    return buf.getvalue()
 
 
 @pytest.fixture(autouse=True)
@@ -177,7 +188,13 @@ def test_convert_times_out_on_a_slow_conversion(monkeypatch, synthetic_pdf, tess
     def _slow_convert(*args, **kwargs):
         time.sleep(5)
 
-    monkeypatch.setattr("documents_converter.api.app.convert_scanned_to_excel", _slow_convert)
+    # Phase 9: app.py no longer imports convert_scanned_to_excel directly --
+    # it's called through the registered Capability's convert function
+    # (documents_converter/converters/ocr_to_excel.py), so that's what
+    # needs patching now for this to actually take effect on the real path.
+    monkeypatch.setattr(
+        "documents_converter.converters.ocr_to_excel.convert_scanned_to_excel", _slow_convert
+    )
 
     with open(synthetic_pdf, "rb") as f:
         resp = client.post(
@@ -357,7 +374,13 @@ def test_get_job_result_409_before_job_completes(synthetic_pdf, tesseract_cmd, m
     def _slow_convert(*args, **kwargs):
         time.sleep(5)
 
-    monkeypatch.setattr("documents_converter.api.app.convert_scanned_to_excel", _slow_convert)
+    # Phase 9: app.py no longer imports convert_scanned_to_excel directly --
+    # it's called through the registered Capability's convert function
+    # (documents_converter/converters/ocr_to_excel.py), so that's what
+    # needs patching now for this to actually take effect on the real path.
+    monkeypatch.setattr(
+        "documents_converter.converters.ocr_to_excel.convert_scanned_to_excel", _slow_convert
+    )
 
     with open(synthetic_pdf, "rb") as f:
         resp = client.post(
@@ -367,3 +390,106 @@ def test_get_job_result_409_before_job_completes(synthetic_pdf, tesseract_cmd, m
 
     result_resp = client.get(f"/api/v1/jobs/{job_id}/result")
     assert result_resp.status_code == 409
+
+
+# --------------------------------------------------------------------------
+# Phase 9: capability registry (documents_converter/registry.py) and the
+# new image->pdf conversion routed through it, proving /convert and /jobs
+# aren't hardcoded to OCR->Excel any more.
+# --------------------------------------------------------------------------
+
+
+def test_capabilities_endpoint_lists_both_registered_conversions():
+    resp = client.get("/api/v1/capabilities")
+    assert resp.status_code == 200
+    body = resp.json()
+    pairs = {(c["source_format"], c["target_format"]) for c in body}
+    assert ("scanned_document", "xlsx") in pairs
+    assert ("image", "pdf") in pairs
+    image_to_pdf = next(c for c in body if c["target_format"] == "pdf")
+    assert ".png" in image_to_pdf["accepted_extensions"]
+
+
+def test_capabilities_endpoint_requires_no_auth(monkeypatch):
+    """Discovery metadata, like /health -- must stay reachable even when
+    API_KEYS is configured, the same way /health does."""
+    monkeypatch.setattr(config, "API_KEYS", ("secret-key-1",))
+    resp = client.get("/api/v1/capabilities")
+    assert resp.status_code == 200
+
+
+def test_convert_rejects_target_with_no_matching_capability():
+    """A .pdf file asking for target=pdf has no registered capability
+    (pdf->pdf isn't a thing here) -- must be a clean 400 through the
+    registry, not a 500 or a silent no-op."""
+    resp = client.post(
+        "/api/v1/convert",
+        data={"target": "pdf"},
+        files={"file": ("scan.pdf", io.BytesIO(b"%PDF-1.4 fake content"), "application/pdf")},
+    )
+    assert resp.status_code == 400
+    assert "Unsupported file type" in resp.json()["detail"]
+
+
+def test_convert_image_to_pdf_end_to_end():
+    """The actual proof-of-concept conversion end to end, through the
+    synchronous endpoint: a real PNG in, a real, valid, correctly-sized
+    single-page PDF out -- no OCR involved anywhere in this path."""
+    resp = client.post(
+        "/api/v1/convert",
+        data={"target": "pdf"},
+        files={"file": ("photo.png", io.BytesIO(_sample_png_bytes()), "image/png")},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/pdf"
+    assert resp.headers["content-disposition"] == "attachment; filename=converted.pdf"
+
+    doc = fitz.open(stream=resp.content, filetype="pdf")
+    try:
+        assert doc.page_count == 1
+        page = doc[0]
+        # The rendered page should be roughly the image's own proportions
+        # (40x30, a 4:3 landscape rectangle), not some unrelated default
+        # page size -- a real conversion, not a blank placeholder.
+        assert page.rect.width > page.rect.height
+    finally:
+        doc.close()
+
+
+def test_convert_defaults_to_xlsx_target_when_omitted():
+    """Backward compatibility: a caller that never heard of `target` (every
+    caller before Phase 9) must still get rejected/accepted exactly as
+    before -- an unsupported extension for the implied default (xlsx)
+    still 400s the same way."""
+    resp = client.post(
+        "/api/v1/convert",
+        files={"file": ("not_a_document.exe", io.BytesIO(b"whatever"), "application/octet-stream")},
+    )
+    assert resp.status_code == 400
+    assert "Unsupported file type" in resp.json()["detail"]
+
+
+def test_job_image_to_pdf_end_to_end():
+    """Same conversion, through the async job queue: submit with
+    target=pdf, poll to completion, download, verify it's a real PDF."""
+    resp = client.post(
+        "/api/v1/jobs",
+        data={"target": "pdf"},
+        files={"file": ("photo.png", io.BytesIO(_sample_png_bytes()), "image/png")},
+    )
+    assert resp.status_code == 202
+    job_id = resp.json()["job_id"]
+
+    status = _wait_for_job_terminal(job_id)
+    assert status == "completed", f"job did not complete in time (last status: {status})"
+
+    result_resp = client.get(f"/api/v1/jobs/{job_id}/result")
+    assert result_resp.status_code == 200
+    assert result_resp.headers["content-type"] == "application/pdf"
+    assert result_resp.headers["content-disposition"] == "attachment; filename=converted.pdf"
+
+    doc = fitz.open(stream=result_resp.content, filetype="pdf")
+    try:
+        assert doc.page_count == 1
+    finally:
+        doc.close()
