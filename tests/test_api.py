@@ -5,9 +5,20 @@ endpoints), Phase 4 (security hardening), and Phase 6 (API-key auth).
 Uses the same synthetic, fabricated fixture as the pipeline tests -- see
 tests/fixtures/synthetic_scan.py and docs/PHASE_0_AUDIT.md risk register
 item #1 for why real scanned documents are never used here.
+
+Tests that submit a real async job always wait for it to reach a
+terminal status (_wait_for_job_terminal) before returning, even ones
+that aren't primarily testing job completion. Confirmed the hard way:
+a test that submitted a job and returned immediately without waiting
+left it running in the background, competing with the *next* test's
+job for the same worker pool -- invisible on a fast dev machine, but
+enough contention on GitHub Actions' 2-vCPU runner to push a later
+job's test past its deadline. Real CI failure, not a pipeline bug --
+see the fix commit for the full story.
 """
 
 import io
+import time
 import zipfile
 
 import openpyxl
@@ -183,6 +194,27 @@ def test_convert_times_out_on_a_slow_conversion(monkeypatch, synthetic_pdf, tess
 _junk_file = {"file": ("x.xyz", io.BytesIO(b"data"), "application/octet-stream")}
 
 
+def _wait_for_job_terminal(job_id: str, timeout: float = 120) -> str:
+    """
+    Polls a job until it reaches a terminal status (completed/failed) or
+    `timeout` elapses, returning the last observed status. 120s default,
+    not the 60s originally used here -- CI hardware (GitHub Actions'
+    ubuntu-latest runner: 2 vCPUs) is genuinely slower than a typical dev
+    machine for CPU-bound OCR work, confirmed by reproducing the CI
+    environment locally rather than guessed at.
+    """
+    deadline = time.monotonic() + timeout
+    status = None
+    while time.monotonic() < deadline:
+        status_resp = client.get(f"/api/v1/jobs/{job_id}")
+        assert status_resp.status_code == 200
+        status = status_resp.json()["status"]
+        if status in ("completed", "failed"):
+            return status
+        time.sleep(0.5)
+    return status
+
+
 def test_convert_works_without_auth_when_no_keys_configured():
     """Default state: config.API_KEYS is empty, so auth is off and a request
     with no Authorization header at all must not be rejected with 401 --
@@ -229,3 +261,109 @@ def test_health_never_requires_auth(monkeypatch):
     monkeypatch.setattr(config, "API_KEYS", ("secret-key-1",))
     resp = client.get("/health")
     assert resp.status_code == 200
+
+
+# --------------------------------------------------------------------------
+# Phase 7: async job queue (docs/PHASE_0_AUDIT.md).
+# --------------------------------------------------------------------------
+
+
+def test_create_job_validates_upload_before_queueing():
+    """Bad input is rejected immediately with the normal validation error,
+    not accepted into the queue only to be discovered as 'failed' later by
+    polling."""
+    resp = client.post("/api/v1/jobs", files=_junk_file)
+    assert resp.status_code == 400
+    assert "Unsupported file type" in resp.json()["detail"]
+
+
+def test_create_job_requires_auth_when_configured(monkeypatch):
+    monkeypatch.setattr(config, "API_KEYS", ("secret-key-1",))
+    resp = client.post("/api/v1/jobs", files=_junk_file)
+    assert resp.status_code == 401
+
+
+def test_job_status_and_result_endpoints_require_auth_when_configured(monkeypatch):
+    """Checked with a made-up job id specifically to prove auth is
+    enforced before the job lookup happens (401, not 404)."""
+    monkeypatch.setattr(config, "API_KEYS", ("secret-key-1",))
+    assert client.get("/api/v1/jobs/does-not-exist").status_code == 401
+    assert client.get("/api/v1/jobs/does-not-exist/result").status_code == 401
+
+
+def test_get_job_status_404_for_unknown_id():
+    resp = client.get("/api/v1/jobs/no-such-job-id")
+    assert resp.status_code == 404
+
+
+@requires_tesseract
+def test_create_job_returns_202_with_a_pollable_status(synthetic_pdf, tesseract_cmd, monkeypatch):
+    monkeypatch.setattr(config, "TESSERACT_CMD", tesseract_cmd)
+    with open(synthetic_pdf, "rb") as f:
+        resp = client.post(
+            "/api/v1/jobs", files={"file": ("synthetic_scan.pdf", f, "application/pdf")}
+        )
+    assert resp.status_code == 202
+    body = resp.json()
+    assert "job_id" in body
+    # Racy by nature (the background thread may already have picked it up
+    # by the time this response was built) -- both are valid, "completed"
+    # this early would not be.
+    assert body["status"] in ("queued", "processing")
+
+    # Wait for it to actually finish before this test returns -- otherwise
+    # it keeps running in the background, competing with whatever the next
+    # test does on the same worker pool (see module docstring: this is
+    # exactly what caused a real CI failure).
+    assert _wait_for_job_terminal(body["job_id"]) == "completed"
+
+
+@requires_tesseract
+def test_job_lifecycle_completes_with_correct_result(synthetic_pdf, tesseract_cmd, monkeypatch):
+    """Full async round trip: submit, poll until done, download the
+    result, and check it against the same expected values already locked
+    in by the synchronous end-to-end test."""
+    monkeypatch.setattr(config, "TESSERACT_CMD", tesseract_cmd)
+    with open(synthetic_pdf, "rb") as f:
+        resp = client.post(
+            "/api/v1/jobs", files={"file": ("synthetic_scan.pdf", f, "application/pdf")}
+        )
+    job_id = resp.json()["job_id"]
+
+    status = _wait_for_job_terminal(job_id)
+    assert status == "completed", f"job did not complete in time (last status: {status})"
+
+    result_resp = client.get(f"/api/v1/jobs/{job_id}/result")
+    assert result_resp.status_code == 200
+    assert result_resp.headers["content-type"] == (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    wb = openpyxl.load_workbook(io.BytesIO(result_resp.content))
+    ws = wb[wb.sheetnames[0]]
+    rows = list(ws.iter_rows(values_only=True))
+    assert rows[1][:5] == ("1", "100000001", "SMITH", "JOHN", "M")
+
+
+@requires_tesseract
+def test_get_job_result_409_before_job_completes(synthetic_pdf, tesseract_cmd, monkeypatch):
+    """A job that's still running must report 409 (not ready), not the
+    file -- checked deterministically with a monkeypatched slow
+    conversion rather than racing a real one."""
+    import time
+
+    monkeypatch.setattr(config, "TESSERACT_CMD", tesseract_cmd)
+
+    def _slow_convert(*args, **kwargs):
+        time.sleep(5)
+
+    monkeypatch.setattr("documents_converter.api.app.convert_scanned_to_excel", _slow_convert)
+
+    with open(synthetic_pdf, "rb") as f:
+        resp = client.post(
+            "/api/v1/jobs", files={"file": ("synthetic_scan.pdf", f, "application/pdf")}
+        )
+    job_id = resp.json()["job_id"]
+
+    result_resp = client.get(f"/api/v1/jobs/{job_id}/result")
+    assert result_resp.status_code == 409

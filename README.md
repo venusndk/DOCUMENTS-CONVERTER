@@ -27,6 +27,7 @@ documents_converter/
         security.py                  magic-byte + decompression-bomb checks
         rate_limit.py                per-IP fixed-window rate limiter
         auth.py                      API-key authentication
+        jobs.py                      in-memory async job store
 tests/
     conftest.py
     test_ocr_excel.py                 pipeline/provider regression tests
@@ -87,12 +88,8 @@ the default on the real document this was tuned against).
 
 ## HTTP API (optional)
 
-A minimal synchronous API wraps the same engine, for anything that needs
-to call this over HTTP instead of the CLI. It is deliberately **not** a
-job queue: the request stays open until the conversion finishes, since
-that's the right amount of infrastructure for a first API (see
-`docs/PHASE_0_AUDIT.md` Phase 3) — a queue only earns its complexity once
-real usage shows requests taking long enough to need one.
+An API wraps the same engine, for anything that needs to call this over
+HTTP instead of the CLI. Two ways to call it:
 
 ```powershell
 pip install -r requirements.txt -r requirements-api.txt
@@ -103,29 +100,64 @@ uvicorn documents_converter.api.app:app --reload
 ```
 
 ```
-GET  /health            -> {"status": "ok", "tesseract_available": true}
-POST /api/v1/convert    -> upload a file (multipart/form-data, field name
-                            "file"), get the .xlsx back in the response body
+GET  /health                    -> {"status": "ok", "tesseract_available": true}
+
+POST /api/v1/convert            -> synchronous: upload a file (multipart/form-data,
+                                    field name "file"), the response IS the finished
+                                    .xlsx. Simplest option; the connection stays open
+                                    for the whole conversion.
+
+POST /api/v1/jobs                -> async: upload a file, get back
+                                    {"job_id": "...", "status": "queued"} immediately
+                                    (202). The conversion runs in the background.
+GET  /api/v1/jobs/{id}           -> {"job_id": "...", "status": "queued|processing|
+                                    completed|failed", "error": "..." (if failed)}
+GET  /api/v1/jobs/{id}/result    -> the finished .xlsx, once status is "completed"
+                                    (409 otherwise)
 ```
 
-Example:
+Synchronous example:
 ```powershell
 curl.exe -F "file=@transcript.pdf" http://127.0.0.1:8000/api/v1/convert -o result.xlsx
 ```
+
+Async example:
+```powershell
+curl.exe -F "file=@transcript.pdf" http://127.0.0.1:8000/api/v1/jobs
+# {"job_id": "a1b2c3...", "status": "queued"}
+curl.exe http://127.0.0.1:8000/api/v1/jobs/a1b2c3...
+# poll until "status": "completed"
+curl.exe http://127.0.0.1:8000/api/v1/jobs/a1b2c3.../result -o result.xlsx
+```
+
+Use the synchronous endpoint for quick/small conversions where holding a
+connection open briefly is fine; use the job endpoints for anything slow
+enough that you'd rather not block a client on it, or where the caller
+isn't well-suited to holding a connection open at all. Both share the
+same validation and the same worker pool — see `documents_converter/api/app.py`'s
+module docstring for the resulting known limitation (heavy async load
+can delay sync requests).
+
+The job store (`documents_converter/api/jobs.py`) is in-memory, the same
+honest limitation as the rate limiter below: correct for a single-process
+deployment, but jobs don't survive a restart and aren't visible across
+multiple replicas. Finished jobs' files are cleaned up after
+`JOB_RETENTION_SECONDS` (default: 1 hour).
 
 Configuration (environment variables, see `documents_converter/api/config.py`):
 `TESSERACT_CMD` (default: none, i.e. must be on `PATH`), `MAX_UPLOAD_MB`
 (default: 50), `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS`
 (default: 10 requests per 60s per client IP), `CONVERT_TIMEOUT_SECONDS`
-(default: 180), `API_KEYS` (default: empty, i.e. auth off — see below).
+(default: 180), `JOB_RETENTION_SECONDS` (default: 3600), `API_KEYS`
+(default: empty, i.e. auth off — see below).
 
 ### Authentication
 
-`POST /api/v1/convert` requires an API key once `API_KEYS` is set to a
-comma-separated list; `GET /health` never does (load balancers and
-monitoring probes need to reach it without credentials). Empty by
-default so local/dev use needs no extra setup — set it before exposing
-this to anything other than trusted local use.
+Every `/api/v1/*` route (`/convert` and all three `/jobs` routes) requires
+an API key once `API_KEYS` is set to a comma-separated list; `GET /health`
+never does (load balancers and monitoring probes need to reach it without
+credentials). Empty by default so local/dev use needs no extra setup —
+set it before exposing this to anything other than trusted local use.
 
 ```powershell
 $env:API_KEYS = "some-long-random-key,another-key-for-a-second-caller"

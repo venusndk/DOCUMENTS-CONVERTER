@@ -1,14 +1,22 @@
 """
-Minimal synchronous HTTP API around convert_scanned_to_excel.
+HTTP API around convert_scanned_to_excel.
 
-Deliberately NOT a job queue: the conversion runs inline and the response
-holds the connection open until it's done. That's the right amount of
-infrastructure for Phase 3 (see docs/PHASE_0_AUDIT.md) -- a queue only
-earns its complexity once real usage shows requests taking long enough to
-need it. The endpoint is defined as a plain `def` (not `async def`) so
-FastAPI/Starlette runs it in its worker threadpool rather than blocking
-the event loop, which is the correct middle ground for CPU/IO-bound work
-without building a full async job system yet.
+Phase 3 built a synchronous endpoint (POST /api/v1/convert): the
+conversion runs inline and the response holds the connection open until
+it's done. That's still here, unchanged, for callers who want it -- small
+files convert quickly enough that a job/poll round trip is needless
+overhead for them.
+
+Phase 7 added a genuine async path (POST /api/v1/jobs, GET
+/api/v1/jobs/{id}, GET /api/v1/jobs/{id}/result) for callers who don't
+want to hold a connection open for a slow OCR run: submit returns
+immediately with a job id, the actual conversion runs in the background,
+and the caller polls for status. See jobs.py for the in-memory job store
+and its own documented single-process limitation. Both paths share the
+same validation (_validate_and_save_upload, _check_decompression_bomb)
+and the same worker pool (_convert_executor) -- documented as a known
+limitation in docs/PHASE_0_AUDIT.md: heavy async job load could delay
+sync requests, since they compete for the same 4 worker threads.
 
 Phase 4 added security hardening on top of Phase 3's basic hygiene
 (extension allowlist, safe temp-file naming, no document-content
@@ -16,10 +24,11 @@ logging): magic-byte validation, decompression-bomb limits, per-IP rate
 limiting, a best-effort conversion timeout, and a catch-all exception
 handler so nothing unexpected ever leaks a stack trace to the caller.
 
-Phase 6 added API-key authentication on /api/v1/convert (see auth.py) --
-disabled by default until config.API_KEYS is set, so local/dev use needs
-no extra setup. /health stays unauthenticated on purpose: load balancers
-and monitoring probes need to reach it without credentials.
+Phase 6 added API-key authentication on every /api/v1/* route (see
+auth.py) -- disabled by default until config.API_KEYS is set, so
+local/dev use needs no extra setup. /health stays unauthenticated on
+purpose: load balancers and monitoring probes need to reach it without
+credentials.
 
 Run locally:
     uvicorn documents_converter.api.app:app --reload
@@ -27,6 +36,7 @@ Run locally:
 
 from __future__ import annotations
 
+import shutil
 import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +51,7 @@ import fitz
 
 from . import config, security
 from .auth import require_api_key
+from .jobs import Job, JobStore
 from .rate_limit import FixedWindowRateLimiter
 from ..ocr_excel import check_tesseract_available, convert_scanned_to_excel
 
@@ -50,12 +61,15 @@ _rate_limiter = FixedWindowRateLimiter(
     max_requests=config.RATE_LIMIT_MAX_REQUESTS,
     window_seconds=config.RATE_LIMIT_WINDOW_SECONDS,
 )
-# Shared across requests rather than one-per-request: this is what
-# actually gives convert_scanned_to_excel a wall-clock timeout (see
-# module docstring -- "best-effort" because Python has no safe API to
-# force-kill a thread; an abandoned one keeps running until it finishes
-# on its own, it's just no longer waited on).
+_job_store = JobStore(retention_seconds=config.JOB_RETENTION_SECONDS)
+# Shared by both the sync endpoint and the async job runner -- see module
+# docstring for the resulting known limitation. Also what actually gives
+# the sync endpoint a wall-clock timeout ("best-effort" because Python has
+# no safe API to force-kill a thread; an abandoned one keeps running until
+# it finishes on its own, it's just no longer waited on).
 _convert_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="convert")
+
+XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 @app.get("/health")
@@ -72,17 +86,19 @@ def health() -> dict:
     }
 
 
-@app.post("/api/v1/convert", dependencies=[Depends(require_api_key)])
-def convert(request: Request, file: UploadFile) -> Response:
-    """
-    Accepts one scanned PDF or image, returns the extracted table(s) as an
-    .xlsx file. Synchronous: the response is the finished file, not a job
-    reference (see module docstring).
-    """
+def _check_rate_limit(request: Request) -> None:
     client_ip = request.client.host if request.client else "unknown"
     if not _rate_limiter.allow(client_ip):
         raise HTTPException(status_code=429, detail="Too many requests. Please slow down.")
 
+
+def _validate_and_save_upload(request: Request, file: UploadFile, work_dir: Path) -> tuple[Path, str]:
+    """
+    Shared by both the sync and async endpoints: validates the extension,
+    upload size, and magic-byte signature while streaming the upload to
+    `work_dir`. Raises HTTPException on any validation failure.
+    :return: (input_path, ext)
+    """
     ext = Path(file.filename or "").suffix.lower()
     if ext not in config.ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -104,50 +120,65 @@ def convert(request: Request, file: UploadFile) -> Response:
         )
 
     # Never trust the client-supplied filename for path construction --
-    # read into an isolated temp directory under a fixed, safe name.
-    with tempfile.TemporaryDirectory(prefix="docconv-") as tmp_dir:
-        input_path = Path(tmp_dir) / f"input{ext}"
-        output_path = Path(tmp_dir) / "output.xlsx"
-
-        size = 0
-        header_checked = False
-        with open(input_path, "wb") as f:
-            while chunk := file.file.read(1024 * 1024):
-                if not header_checked:
-                    if not security.matches_magic_bytes(
-                        ext, chunk[: security.MAGIC_BYTES_TO_READ]
-                    ):
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"File content doesn't match its extension ({ext}).",
-                        )
-                    header_checked = True
-                size += len(chunk)
-                if size > max_bytes:
+    # write under a fixed, safe name instead.
+    input_path = work_dir / f"input{ext}"
+    size = 0
+    header_checked = False
+    with open(input_path, "wb") as f:
+        while chunk := file.file.read(1024 * 1024):
+            if not header_checked:
+                if not security.matches_magic_bytes(ext, chunk[: security.MAGIC_BYTES_TO_READ]):
                     raise HTTPException(
-                        status_code=413,
-                        detail=f"File exceeds the {config.MAX_UPLOAD_MB} MB limit.",
+                        status_code=400,
+                        detail=f"File content doesn't match its extension ({ext}).",
                     )
-                f.write(chunk)
+                header_checked = True
+            size += len(chunk)
+            if size > max_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File exceeds the {config.MAX_UPLOAD_MB} MB limit.",
+                )
+            f.write(chunk)
+
+    return input_path, ext
+
+
+def _check_decompression_bomb(input_path: Path, ext: str) -> None:
+    """Checks the parsed/decompressed size (PDF page count, image pixel
+    dimensions) before the expensive OCR pipeline runs. Raises
+    security.FileTooLargeError if it's over the configured limit."""
+    if ext == ".pdf":
+        doc = fitz.open(str(input_path))
+        n_pages = len(doc)
+        doc.close()
+        security.check_pdf_page_count(n_pages)
+    else:
+        with PILImage.open(input_path) as img:
+            security.check_image_dimensions(*img.size)
+
+
+@app.post("/api/v1/convert", dependencies=[Depends(require_api_key)])
+def convert(request: Request, file: UploadFile) -> Response:
+    """
+    Accepts one scanned PDF or image, returns the extracted table(s) as an
+    .xlsx file. Synchronous: the response is the finished file, not a job
+    reference. See /api/v1/jobs for the async alternative.
+    """
+    _check_rate_limit(request)
+
+    with tempfile.TemporaryDirectory(prefix="docconv-") as tmp_dir:
+        input_path, ext = _validate_and_save_upload(request, file, Path(tmp_dir))
+        output_path = Path(tmp_dir) / "output.xlsx"
 
         request_id = uuid.uuid4().hex[:12]
         # Safe metadata only (docs/PHASE_0_AUDIT.md: never log document
         # contents) -- extension and size, not the client-supplied filename
         # or anything read from inside the file.
-        print(f"[{request_id}] convert request: ext={ext} size={size}B")
+        print(f"[{request_id}] convert request: ext={ext} size={input_path.stat().st_size}B")
 
         try:
-            # Decompression-bomb guard: check the parsed/decompressed size
-            # before running the full (much more expensive) OCR pipeline.
-            if ext == ".pdf":
-                doc = fitz.open(str(input_path))
-                n_pages = len(doc)
-                doc.close()
-                security.check_pdf_page_count(n_pages)
-            else:
-                with PILImage.open(input_path) as img:
-                    security.check_image_dimensions(*img.size)
-
+            _check_decompression_bomb(input_path, ext)
             future = _convert_executor.submit(
                 convert_scanned_to_excel,
                 file_path=str(input_path),
@@ -182,7 +213,94 @@ def convert(request: Request, file: UploadFile) -> Response:
 
     return Response(
         content=xlsx_bytes,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=XLSX_MEDIA_TYPE,
+        headers={"Content-Disposition": "attachment; filename=converted.xlsx"},
+    )
+
+
+def _run_job(job: Job, input_path: Path, output_path: Path, ext: str, request_id: str) -> None:
+    """Runs on the shared executor, in the background -- the HTTP request
+    that created this job has already returned by the time this runs."""
+    _job_store.update(job.id, status="processing")
+    try:
+        _check_decompression_bomb(input_path, ext)
+        convert_scanned_to_excel(
+            file_path=str(input_path),
+            output_excel_path=str(output_path),
+            tesseract_cmd=config.TESSERACT_CMD,
+            progress=lambda msg: print(f"[{request_id}] {msg}"),
+        )
+        _job_store.update(job.id, status="completed", result_path=output_path)
+    except security.FileTooLargeError as e:
+        _job_store.update(job.id, status="failed", error=str(e))
+    except EnvironmentError as e:
+        _job_store.update(job.id, status="failed", error=str(e))
+    except Exception as e:
+        # Same failure philosophy as the sync endpoint: log the real error
+        # server-side, expose only a generic message via the status endpoint.
+        print(f"[{request_id}] job {job.id} failed: {e!r}")
+        _job_store.update(
+            job.id, status="failed", error="Conversion failed. This has been logged for investigation."
+        )
+
+
+@app.post("/api/v1/jobs", dependencies=[Depends(require_api_key)], status_code=202)
+def create_job(request: Request, file: UploadFile) -> dict:
+    """
+    Accepts one scanned PDF or image, validates it synchronously (so bad
+    input is rejected immediately, not discovered later by polling), then
+    queues the actual OCR conversion in the background and returns right
+    away with a job id to poll.
+    """
+    _check_rate_limit(request)
+
+    job = _job_store.create()
+    work_dir = Path(tempfile.mkdtemp(prefix=f"docconv-job-{job.id}-"))
+    job.work_dir = work_dir
+
+    try:
+        input_path, ext = _validate_and_save_upload(request, file, work_dir)
+        _check_decompression_bomb(input_path, ext)
+    except HTTPException:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        _job_store.update(job.id, status="failed")
+        raise
+    except security.FileTooLargeError as e:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise HTTPException(status_code=413, detail=str(e)) from e
+
+    output_path = work_dir / "output.xlsx"
+    request_id = uuid.uuid4().hex[:12]
+    print(f"[{request_id}] job {job.id} queued: ext={ext} size={input_path.stat().st_size}B")
+
+    _convert_executor.submit(_run_job, job, input_path, output_path, ext, request_id)
+
+    return {"job_id": job.id, "status": job.status}
+
+
+@app.get("/api/v1/jobs/{job_id}", dependencies=[Depends(require_api_key)])
+def get_job_status(job_id: str) -> dict:
+    job = _job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    body = {"job_id": job.id, "status": job.status}
+    if job.error:
+        body["error"] = job.error
+    return body
+
+
+@app.get("/api/v1/jobs/{job_id}/result", dependencies=[Depends(require_api_key)])
+def get_job_result(job_id: str) -> Response:
+    job = _job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job.status != "completed":
+        raise HTTPException(
+            status_code=409, detail=f"Job is '{job.status}', not completed yet."
+        )
+    return Response(
+        content=job.result_path.read_bytes(),
+        media_type=XLSX_MEDIA_TYPE,
         headers={"Content-Disposition": "attachment; filename=converted.xlsx"},
     )
 

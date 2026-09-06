@@ -41,3 +41,8 @@ RATE_LIMIT_WINDOW_SECONDS: float = float(os.environ.get("RATE_LIMIT_WINDOW_SECON
 # app.py. Real documents in this project's own testing took well under a
 # minute; generous enough to allow that with margin for a slow machine.
 CONVERT_TIMEOUT_SECONDS: float = float(os.environ.get("CONVERT_TIMEOUT_SECONDS", "180"))
+
+# Phase 7 (docs/PHASE_0_AUDIT.md): async job queue. How long a finished
+# (completed or failed) job's result stays downloadable before its temp
+# files are cleaned up.
+JOB_RETENTION_SECONDS: float = float(os.environ.get("JOB_RETENTION_SECONDS", "3600"))
