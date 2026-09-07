@@ -20,7 +20,6 @@ real persistence.
 
 from __future__ import annotations
 
-import shutil
 import time
 import uuid
 from dataclasses import dataclass
@@ -29,6 +28,7 @@ from typing import Literal
 
 from .db import SessionLocal
 from .models import JobRecord
+from .storage import storage
 
 JobStatus = Literal["queued", "processing", "completed", "failed"]
 
@@ -113,7 +113,7 @@ class JobStore:
                 .all()
             )
             for record in expired:
-                if record.work_dir and Path(record.work_dir).exists():
-                    shutil.rmtree(record.work_dir, ignore_errors=True)
+                if record.work_dir:
+                    storage.release(Path(record.work_dir))
                 session.delete(record)
             session.commit()

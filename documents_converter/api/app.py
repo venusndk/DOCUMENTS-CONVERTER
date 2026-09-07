@@ -26,6 +26,12 @@ Phase 4 added security hardening on top of Phase 3's basic hygiene
 logging): magic-byte validation, decompression-bomb limits, per-IP rate
 limiting, a best-effort conversion timeout, and a catch-all exception
 handler so nothing unexpected ever leaks a stack trace to the caller.
+Phase 3 completion (master directive numbering) later centralized the
+raw tempfile.mkdtemp()/TemporaryDirectory() and shutil.rmtree() calls
+that used to be scattered across this file behind one storage
+abstraction (storage.py) instead -- same on-disk behavior, now one seam
+a future backend could plug into rather than several call sites to
+update.
 
 Phase 6 added API-key authentication on every /api/v1/* route (see
 auth.py) -- disabled by default until config.API_KEYS is set, so
@@ -53,8 +59,6 @@ Run locally:
 
 from __future__ import annotations
 
-import shutil
-import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -73,6 +77,7 @@ from .auth import require_api_key
 from .db import check_db_connection
 from .jobs import Job, JobStore
 from .rate_limit import FixedWindowRateLimiter
+from .storage import storage
 from .. import converters  # noqa: F401 -- import for its registration side effect only
 from ..ocr_excel import check_tesseract_available
 from ..registry import Capability, registry
@@ -327,10 +332,11 @@ def convert(request: Request, file: UploadFile, target: str = Form("xlsx")) -> R
     """
     _check_rate_limit(request)
 
-    with tempfile.TemporaryDirectory(prefix="docconv-") as tmp_dir:
-        input_path, ext = _validate_and_save_upload(request, file, Path(tmp_dir))
+    work_dir = storage.allocate("docconv-")
+    try:
+        input_path, ext = _validate_and_save_upload(request, file, work_dir)
         capability = _resolve_capability(ext, target)
-        output_path = Path(tmp_dir) / f"output{capability.output_extension}"
+        output_path = work_dir / f"output{capability.output_extension}"
 
         request_id = uuid.uuid4().hex[:12]
         size_bytes = input_path.stat().st_size
@@ -403,6 +409,8 @@ def convert(request: Request, file: UploadFile, target: str = Form("xlsx")) -> R
             duration_ms=int((time.monotonic() - start_time) * 1000),
         )
         result_bytes = output_path.read_bytes()
+    finally:
+        storage.release(work_dir)
 
     return Response(
         content=result_bytes,
@@ -472,7 +480,7 @@ def create_job(request: Request, file: UploadFile, target: str = Form("xlsx")) -
     _check_rate_limit(request)
 
     job = _job_store.create()
-    work_dir = Path(tempfile.mkdtemp(prefix=f"docconv-job-{job.id}-"))
+    work_dir = storage.allocate(f"docconv-job-{job.id}-")
     job.work_dir = work_dir
 
     try:
@@ -480,11 +488,11 @@ def create_job(request: Request, file: UploadFile, target: str = Form("xlsx")) -
         capability = _resolve_capability(ext, target)
         _check_decompression_bomb(input_path, ext)
     except HTTPException:
-        shutil.rmtree(work_dir, ignore_errors=True)
+        storage.release(work_dir)
         _job_store.update(job.id, status="failed")
         raise
     except security.FileTooLargeError as e:
-        shutil.rmtree(work_dir, ignore_errors=True)
+        storage.release(work_dir)
         raise HTTPException(status_code=413, detail=str(e)) from e
 
     output_path = work_dir / f"output{capability.output_extension}"
