@@ -17,6 +17,16 @@ venv/
 *.egg-info/
 .pytest_cache/
 
+# Local SQLite database (Phase 1 completion: documents_converter/api/db.py) --
+# the default DATABASE_URL points here for zero-config local/dev use.
+# Never committed: it's runtime state (job records), not source, and a
+# real deployment either mounts a volume for it or points DATABASE_URL
+# at Postgres instead.
+data/
+*.db
+*.sqlite
+*.sqlite3
+
 # OS/editor cruft
 .DS_Store
 Thumbs.db

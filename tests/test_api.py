@@ -63,6 +63,9 @@ def test_health_reports_status_and_tesseract_availability():
     body = resp.json()
     assert body["status"] == "ok"
     assert isinstance(body["tesseract_available"], bool)
+    # Phase 1 completion: a real database round trip, not just "the app
+    # imported without raising" -- see documents_converter/api/db.py.
+    assert body["database_available"] is True
 
 
 def test_convert_rejects_unsupported_extension():
@@ -392,6 +395,15 @@ def test_get_job_result_409_before_job_completes(synthetic_pdf, tesseract_cmd, m
 
     result_resp = client.get(f"/api/v1/jobs/{job_id}/result")
     assert result_resp.status_code == 409
+
+    # Per this module's own docstring: always wait for a submitted job to
+    # reach a terminal state before the test returns, even one whose
+    # actual assertion happened mid-flight -- otherwise the background
+    # thread (still sleeping inside _slow_convert) outlives this test and
+    # later writes to a torn-down capture stream once it wakes up and
+    # calls audit.log_event(), producing spurious "I/O operation on
+    # closed file" logging errors in whatever test happens to run next.
+    _wait_for_job_terminal(job_id, timeout=15)
 
 
 # --------------------------------------------------------------------------
