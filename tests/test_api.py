@@ -574,3 +574,76 @@ def test_job_emits_created_and_completed_audit_events(caplog):
     assert kinds == ["job_created", "job_completed"]
     assert events[0]["job_id"] == job_id == events[1]["job_id"]
     assert events[0]["endpoint"] == "async"
+
+
+# --------------------------------------------------------------------------
+# Phase 4 completion: POST /api/v1/analyze (documents_converter/document_analysis.py).
+# --------------------------------------------------------------------------
+
+
+def test_analyze_reports_image_metadata_and_dimensions():
+    resp = client.post(
+        "/api/v1/analyze",
+        files={"file": ("photo.png", io.BytesIO(_sample_png_bytes()), "image/png")},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["doc_type"] == "image"
+    assert body["classification"] == "image"
+    assert body["page_count"] == 1
+    assert body["metadata"]["format"] == "PNG"
+    assert body["pages"] == []
+
+
+def test_analyze_does_not_run_any_conversion():
+    """The whole point of a separate analyze endpoint: no output file,
+    no job, just an inspection -- confirmed by checking the response has
+    no job_id/download-shaped fields, only analysis fields."""
+    resp = client.post(
+        "/api/v1/analyze",
+        files={"file": ("photo.png", io.BytesIO(_sample_png_bytes()), "image/png")},
+    )
+    assert resp.status_code == 200
+    assert set(resp.json().keys()) == {
+        "doc_type",
+        "page_count",
+        "classification",
+        "pages",
+        "metadata",
+        "quality_flags",
+    }
+
+
+def test_analyze_rejects_unrecognized_extension():
+    resp = client.post("/api/v1/analyze", files=_junk_file)
+    assert resp.status_code == 400
+    assert "Cannot analyze" in resp.json()["detail"]
+
+
+def test_analyze_requires_auth_when_configured(monkeypatch):
+    monkeypatch.setattr(config, "API_KEYS", ("secret-key-1",))
+    resp = client.post(
+        "/api/v1/analyze",
+        files={"file": ("photo.png", io.BytesIO(_sample_png_bytes()), "image/png")},
+    )
+    assert resp.status_code == 401
+
+
+def test_analyze_emits_requested_and_completed_audit_events_without_raw_metadata(caplog):
+    with caplog.at_level(logging.INFO, logger="documents_converter.audit"):
+        resp = client.post(
+            "/api/v1/analyze",
+            files={"file": ("photo.png", io.BytesIO(_sample_png_bytes()), "image/png")},
+        )
+    assert resp.status_code == 200
+
+    events = _audit_events(caplog)
+    kinds = [e["event"] for e in events]
+    assert kinds == ["analyze_requested", "analyze_completed"]
+    assert events[1]["classification"] == "image"
+    assert events[1]["page_count"] == 1
+    # The raw metadata dict (format/mode/width/height/dpi) never reaches
+    # the audit log -- only derived, safe summary fields do (see
+    # document_analysis.DocumentAnalysis's own docstring on why).
+    assert "metadata" not in events[1]
+    assert "width" not in events[1]
