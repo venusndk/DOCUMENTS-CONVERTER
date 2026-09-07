@@ -9,6 +9,7 @@ never real scanned documents, which contain genuine personal data (see
 docs/PHASE_0_AUDIT.md risk register item #1).
 """
 
+import json
 import zipfile
 
 import fitz
@@ -158,6 +159,41 @@ def test_convert_scanned_to_excel_end_to_end(tmp_path, synthetic_pdf, tesseract_
 
     student2 = rows[3][:9]
     assert student2 == ("2", "100000002", "DOE", "JANE", "F", "70,00", "65,00", "135", "67,50")
+
+
+@requires_tesseract
+def test_review_json_matches_the_written_xlsx(tmp_path, synthetic_pdf, tesseract_cmd):
+    """
+    Phase 7 completion (master directive numbering): "preview"/"human
+    review" support. The review JSON is a separate, independently
+    generated artifact -- this locks in that it actually describes the
+    same cells the .xlsx contains, addressed the same way
+    (documents_converter/api/app.py's review endpoints rely on exactly
+    this correspondence to apply corrections back to the right cell).
+    """
+    out_path = tmp_path / "out.xlsx"
+    review_path = tmp_path / "out.review.json"
+    ste.convert_scanned_to_excel(
+        file_path=str(synthetic_pdf),
+        output_excel_path=str(out_path),
+        tesseract_cmd=tesseract_cmd,
+        review_json_path=str(review_path),
+    )
+
+    assert review_path.exists()
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+
+    wb = openpyxl.load_workbook(str(out_path))
+    assert [t["sheet_name"] for t in review["tables"]] == wb.sheetnames
+
+    table = review["tables"][0]
+    ws = wb[table["sheet_name"]]
+    for row in table["rows"]:
+        for cell in row["cells"]:
+            # openpyxl is 1-indexed; row_index/col_index in the review
+            # JSON are the same 0-indexed coordinates xlsxwriter wrote at.
+            xlsx_value = ws.cell(row=row["row_index"] + 1, column=cell["col_index"] + 1).value
+            assert cell["value"] == xlsx_value
 
 
 # --------------------------------------------------------------------------

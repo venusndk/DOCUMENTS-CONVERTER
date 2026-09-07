@@ -25,11 +25,22 @@ def _convert(input_path: Path, output_path: Path, *, progress: Callable[[str], N
     # conversion itself, not the web app.
     from ..api import config
 
+    # A sibling file next to the .xlsx, not a new field on the Capability/
+    # ConvertFn protocol (documents_converter/registry.py) -- keeps the
+    # "preview"/"human review" support (master directive Phase 7
+    # completion) entirely inside this one capability's own module
+    # instead of every capability (image_to_pdf, searchable_pdf) needing
+    # to know about a concept only this one uses. The API layer
+    # (documents_converter/api/app.py) just checks whether this file
+    # exists after a job completes -- it doesn't need to know why.
+    review_json_path = output_path.parent / f"{output_path.stem}.review.json"
+
     convert_scanned_to_excel(
         file_path=str(input_path),
         output_excel_path=str(output_path),
         tesseract_cmd=config.TESSERACT_CMD,
         progress=progress,
+        review_json_path=str(review_json_path),
     )
 
 

@@ -172,6 +172,50 @@
     text-decoration: none;
   }
 
+  /* Phase 7 completion (master directive numbering): preview + human
+     review. Only shown for a completed job whose capability produced
+     review data (currently OCR->Excel) -- see #target-field's own
+     show/hide convention above. */
+  #review-field { display: none; }
+  #review-field.visible { display: block; }
+  #review-help { font-size: 0.8rem; color: var(--muted); margin: 0 0 12px; }
+  #review-tables h3 {
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin: 16px 0 8px;
+  }
+  .review-table-wrapper {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .review-table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+  .review-table td {
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+    white-space: nowrap;
+  }
+  .review-table td[contenteditable="true"]:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  /* Same semantic meaning as the "processing" status color (Phase 10):
+     "needs attention", not necessarily wrong -- amber, not red. The
+     small corner mark plus the cell's own `title` tooltip (set in JS)
+     mean a suspicious cell is never signaled by color alone. */
+  .review-table td.suspicious {
+    background: var(--status-processing-surface);
+    color: var(--status-processing-text);
+    position: relative;
+  }
+  .review-table td.suspicious::after {
+    content: "⚠";
+    position: absolute;
+    top: 0;
+    right: 2px;
+    font-size: 0.7em;
+  }
+
   .footnote { margin-top: 24px; font-size: 0.75rem; color: var(--muted); text-align: center; }
 </style>
 </head>
@@ -200,6 +244,18 @@
     <button id="submit-btn" disabled>Convert</button>
 
     <div id="status" role="status" aria-live="polite"></div>
+
+    <div class="field" id="review-field">
+      <label>Review extracted data</label>
+      <p id="review-help">
+        Cells marked ⚠ didn't pass a basic sanity check during OCR --
+        worth a glance before trusting this as an official record. Click
+        any cell to edit it directly.
+      </p>
+      <div id="review-tables"></div>
+      <button id="confirm-download-btn" type="button">Confirm &amp; Download</button>
+    </div>
+
     <a id="download-link" href="#">⬇ Download result</a>
 
     <p class="footnote">
@@ -220,9 +276,19 @@
   const apiKeyInput = document.getElementById("api-key");
   const submitBtn = document.getElementById("submit-btn");
   const statusEl = document.getElementById("status");
+  const reviewField = document.getElementById("review-field");
+  const reviewTablesEl = document.getElementById("review-tables");
+  const confirmDownloadBtn = document.getElementById("confirm-download-btn");
   const downloadLink = document.getElementById("download-link");
 
   let selectedFile = null;
+  // Set only while a completed job's review data is on screen awaiting
+  // confirmation (Phase 7 completion) -- the job id corrections/download
+  // apply to, and the fetched {"tables": [...]} data itself (mutated in
+  // place as the source of truth for diffing edited cells against their
+  // original values).
+  let pendingReviewJobId = null;
+  let reviewData = null;
 
   // Phase 2 completion (master directive numbering): frontend capability
   // discovery. Everything about "what can this file become, and which
@@ -351,7 +417,7 @@
         throw new Error(body.detail || `Status check failed (${resp.status})`);
       }
       const body = await resp.json();
-      if (body.status === "completed") return;
+      if (body.status === "completed") return body; // includes has_review
       if (body.status === "failed") throw new Error(body.error || "Conversion failed.");
       setStatus("processing", `Converting… (${body.status})`);
       await new Promise((r) => setTimeout(r, 1000));
@@ -380,10 +446,116 @@
     downloadLink.click();
   }
 
+  // Phase 7 completion (master directive numbering): preview + human
+  // review. A completed job whose capability produced review data
+  // (currently OCR->Excel only -- see GET /api/v1/jobs/{id}'s
+  // has_review field) gets shown here, editable, instead of being
+  // downloaded immediately -- so a person can check/fix flagged cells
+  // before trusting the file as an official record.
+  async function showReview(jobId) {
+    const resp = await fetch(`/api/v1/jobs/${jobId}/review`, { headers: authHeaders() });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || `Loading review data failed (${resp.status})`);
+    }
+    reviewData = await resp.json();
+    pendingReviewJobId = jobId;
+    renderReviewTables();
+    reviewField.classList.add("visible");
+  }
+
+  function renderReviewTables() {
+    reviewTablesEl.innerHTML = "";
+    for (const table of reviewData.tables) {
+      const heading = document.createElement("h3");
+      heading.textContent = table.sheet_name;
+      reviewTablesEl.appendChild(heading);
+
+      const wrapper = document.createElement("div");
+      wrapper.className = "review-table-wrapper";
+      const el = document.createElement("table");
+      el.className = "review-table";
+
+      const rows = [...table.rows].sort((a, b) => a.row_index - b.row_index);
+      for (const row of rows) {
+        const tr = document.createElement("tr");
+        const cells = [...row.cells].sort((a, b) => a.col_index - b.col_index);
+        for (const cell of cells) {
+          const td = document.createElement("td");
+          td.textContent = cell.value ?? "";
+          td.contentEditable = "true";
+          td.dataset.sheet = table.sheet_name;
+          td.dataset.row = row.row_index;
+          td.dataset.col = cell.col_index;
+          td.dataset.original = cell.value ?? "";
+          if (cell.suspicious) {
+            td.classList.add("suspicious");
+            td.title = "Didn't pass a basic sanity check during OCR -- worth checking.";
+          }
+          tr.appendChild(td);
+        }
+        el.appendChild(tr);
+      }
+      wrapper.appendChild(el);
+      reviewTablesEl.appendChild(wrapper);
+    }
+  }
+
+  function collectCorrections() {
+    const corrections = [];
+    reviewTablesEl.querySelectorAll("td[data-sheet]").forEach((td) => {
+      const value = td.textContent;
+      if (value !== td.dataset.original) {
+        corrections.push({
+          sheet_name: td.dataset.sheet,
+          row_index: Number(td.dataset.row),
+          col_index: Number(td.dataset.col),
+          value,
+        });
+      }
+    });
+    return corrections;
+  }
+
+  function resetReviewState() {
+    pendingReviewJobId = null;
+    reviewData = null;
+    reviewTablesEl.innerHTML = "";
+    reviewField.classList.remove("visible");
+  }
+
+  confirmDownloadBtn.addEventListener("click", async () => {
+    confirmDownloadBtn.disabled = true;
+    try {
+      const corrections = collectCorrections();
+      if (corrections.length) {
+        setStatus("processing", `Saving ${corrections.length} correction(s)…`);
+        const resp = await fetch(`/api/v1/jobs/${pendingReviewJobId}/review`, {
+          method: "POST",
+          headers: { ...authHeaders(), "Content-Type": "application/json" },
+          body: JSON.stringify(corrections),
+        });
+        if (!resp.ok) {
+          const body = await resp.json().catch(() => ({}));
+          throw new Error(body.detail || `Saving corrections failed (${resp.status})`);
+        }
+      }
+      const jobId = pendingReviewJobId;
+      resetReviewState();
+      setStatus("success", "Done! Your download should start automatically.");
+      await downloadResult(jobId);
+    } catch (err) {
+      setStatus("error", err.message || "Something went wrong.");
+    } finally {
+      confirmDownloadBtn.disabled = false;
+    }
+  });
+
   submitBtn.addEventListener("click", async () => {
     if (!selectedFile) return;
     submitBtn.disabled = true;
     downloadLink.style.display = "none";
+    resetReviewState();
     setStatus("processing", "Uploading…");
 
     try {
@@ -405,10 +577,15 @@
       const { job_id } = await resp.json();
 
       setStatus("processing", "Converting…");
-      await pollJob(job_id);
+      const finalStatus = await pollJob(job_id);
 
-      setStatus("success", "Done! Your download should start automatically.");
-      await downloadResult(job_id);
+      if (finalStatus.has_review) {
+        await showReview(job_id);
+        setStatus("processing", "Review the extracted data below, then confirm to download.");
+      } else {
+        setStatus("success", "Done! Your download should start automatically.");
+        await downloadResult(job_id);
+      }
     } catch (err) {
       setStatus("error", err.message || "Something went wrong.");
     } finally {

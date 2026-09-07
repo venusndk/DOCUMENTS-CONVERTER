@@ -118,8 +118,10 @@ the default on the real document this was tuned against).
 
 Open `http://127.0.0.1:8000/` (or wherever the API is running) in a
 browser for a real, no-curl-required page: choose or drag a file, pick
-what to convert it to, click Convert, watch it process, and the finished
-file downloads automatically. A single self-contained HTML file
+what to convert it to, click Convert, and watch it process. An
+OCR→Excel result shows the extracted tables for review first (Phase 7
+completion, below) — every other target downloads automatically once
+done. A single self-contained HTML file
 (`documents_converter/api/static/index.html`, inline CSS/JS, no build
 step) served directly by the API, calling the same `/api/v1/jobs`
 endpoints documented below — nothing here has its own state or logic
@@ -262,6 +264,37 @@ Exposed via `POST /api/v1/analyze` (see below) — independent of
 `/convert`/`/jobs`, so a caller (or a future frontend feature) can
 inspect a file before committing to a conversion.
 
+## Preview & human review (Phase 7 completion)
+
+An OCR→Excel job's completed result isn't just a file to download
+blind: `GET /api/v1/jobs/{id}/review` returns every detected table as
+structured JSON — one entry per cell, with its value and whether it
+tripped the suspicious-cell check (the same `--flag-suspicious-cells`
+check that highlights cells yellow in the `.xlsx` itself) — and
+`POST /api/v1/jobs/{id}/review` accepts corrections, applied to both
+that JSON and the actual result file, so a later download reflects
+them. A corrected cell that no longer looks suspicious has its
+highlight cleared automatically. Only OCR→Excel jobs produce review
+data (`GET /api/v1/jobs/{id}`'s `has_review` field says so) — there's
+no "table" concept to review for the image→PDF or searchable-PDF
+targets.
+
+The web page uses this directly: after a job with `has_review: true`
+completes, it shows the extracted tables inline instead of downloading
+immediately — flagged cells marked ⚠ (never color alone, per the Phase
+10 accessibility standard), every cell directly editable in place — and
+only downloads once "Confirm & Download" is clicked, saving whatever
+was edited first. Verified with a real browser (Playwright): edited an
+actual cell through the real UI, confirmed, and checked the downloaded
+`.xlsx` reflects the edit.
+
+```powershell
+curl.exe http://127.0.0.1:8000/api/v1/jobs/a1b2c3.../review
+curl.exe -X POST http://127.0.0.1:8000/api/v1/jobs/a1b2c3.../review `
+  -H "Content-Type: application/json" `
+  -d '[{"sheet_name": "Page 1 - Table 1", "row_index": 0, "col_index": 0, "value": "Corrected"}]'
+```
+
 ## HTTP API (optional)
 
 An API wraps the registry above, for anything that needs to call this over
@@ -323,10 +356,16 @@ POST /api/v1/jobs                -> async: same fields ("file", optional "target
                                     immediately (202). The conversion runs in the
                                     background.
 GET  /api/v1/jobs/{id}           -> {"job_id": "...", "status": "queued|processing|
-                                    completed|failed", "error": "..." (if failed)}
+                                    completed|failed", "has_review": bool,
+                                    "error": "..." (if failed)}
 GET  /api/v1/jobs/{id}/result    -> the finished file, once status is "completed"
                                     (409 otherwise) -- Content-Type and filename
                                     extension match whichever capability ran.
+GET  /api/v1/jobs/{id}/review    -> extracted table data + suspicious flags, once
+                                    "has_review" is true (404 otherwise -- only
+                                    OCR->Excel jobs produce this). See below.
+POST /api/v1/jobs/{id}/review    -> apply corrections (see below); updates both the
+                                    review data and the actual result file.
 ```
 
 Analyze example (a genuinely mixed PDF -- one digital page, one scanned):
@@ -628,6 +667,10 @@ an image and comparing it cell-by-cell against the extracted spreadsheet
    artifact checked), the flagging system caught it. **Recommended
    workflow for official use: review every yellow cell before treating
    the output as a record. Don't disable this flag for that use case.**
+   The web page and `GET/POST /api/v1/jobs/{id}/review` (Phase 7
+   completion, above) make that recommended review step an actual part
+   of the workflow, not something left to a separate manual step outside
+   this tool.
 
 ### Practical recommendation
 
