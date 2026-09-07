@@ -108,9 +108,9 @@ the default on the real document this was tuned against).
 ## Web page
 
 Open `http://127.0.0.1:8000/` (or wherever the API is running) in a
-browser for a real, no-curl-required page: choose or drag a file, click
-Convert, watch it process, and the finished `.xlsx` downloads
-automatically. A single self-contained HTML file
+browser for a real, no-curl-required page: choose or drag a file, pick
+what to convert it to, click Convert, watch it process, and the finished
+file downloads automatically. A single self-contained HTML file
 (`documents_converter/api/static/index.html`, inline CSS/JS, no build
 step) served directly by the API, calling the same `/api/v1/jobs`
 endpoints documented below — nothing here has its own state or logic
@@ -121,6 +121,28 @@ the HTML: `tests/test_frontend.py` actually loads the page, picks a file
 through the real file input, clicks the real button, and confirms a real
 file downloads with correct data — the same standard as every other
 end-to-end test in this project.
+
+### Frontend capability discovery (Phase 2 completion)
+
+The page fetches `GET /api/v1/capabilities` on load and uses it for two
+things, so it never hardcodes what the registry already knows:
+
+- the file input's `accept` attribute is the union of every registered
+  capability's accepted extensions, not a fixed list maintained by hand;
+- choosing a file populates a "Convert to" dropdown with every target
+  format that file's extension is valid for (a `.png`, for instance,
+  matches both the OCR→Excel and image→PDF capabilities, so both appear,
+  defaulting to `xlsx` to match this page's original behavior), with the
+  matching capability's own description shown underneath. A file with no
+  matching capability at all is rejected client-side, before any network
+  request, with the Convert button disabled.
+
+If the capabilities fetch itself fails (network hiccup, or an older
+server without the endpoint), the page falls back to its pre-Phase-2
+behavior: accept anything, always send `target=xlsx`. Verified end to
+end with a real browser: `tests/test_frontend.py` drives an actual image
+through the dropdown to `target=pdf` and checks the downloaded file is a
+real, correctly-sized PDF — not just that the dropdown renders.
 
 ### Status colors (Phase 10)
 
@@ -151,11 +173,6 @@ it appears." A job-history list, per-file badges, or an admin dashboard
 would reuse the same three classes/tokens rather than introduce new
 colors, but none of those surfaces exist in this project yet.
 
-Known limitation: the page always submits to the default `target`
-(OCR→Excel) — it doesn't yet expose the other conversions the registry
-below knows about (e.g. image→PDF). Reaching those currently means
-calling the API directly with an explicit `target` field.
-
 ## Format & capability registry
 
 `documents_converter/registry.py` is the single source of truth for which
@@ -185,6 +202,21 @@ Adding a new conversion means writing one new module under
 it in that package's `__init__.py` — nothing in `app.py`'s routing logic
 needs to change, since it only ever asks the registry "what handles this
 (extension, target) pair?" (`registry.find`, used by `app._resolve_capability`).
+
+The master directive's Phase 2 also names "format definitions" and a
+separate "provider registry" alongside the capability registry and
+capability matrix above. Deliberately not built as distinct
+modules/abstractions here: every registered capability today has exactly
+one implementation, so a provider layer that lets multiple providers
+compete for the same capability would be pure structure with nothing yet
+to plug into it -- exactly the premature infrastructure
+`docs/PHASE_0_AUDIT.md` warns against. `Capability.source_format` /
+`target_format` already serve as the format identifiers in practice (the
+registry itself is the single place that could drift, and it can't,
+since `/api/v1/capabilities` reads live from it). If a second provider
+for the same capability becomes a real need (a cloud OCR fallback
+alongside Tesseract, say), that's the point to introduce the
+provider/capability split for real, not before.
 
 ## HTTP API (optional)
 

@@ -99,8 +99,10 @@
   }
 
   .field { margin-top: 20px; }
+  #target-field { display: none; }
+  #target-field.visible { display: block; }
   label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 6px; }
-  input[type="text"], input[type="password"] {
+  input[type="text"], input[type="password"], select {
     width: 100%;
     padding: 10px 12px;
     border: 1px solid var(--border);
@@ -108,6 +110,11 @@
     font-size: 0.95rem;
     background: var(--card);
     color: var(--ink);
+  }
+  #target-help {
+    margin-top: 6px;
+    font-size: 0.8rem;
+    color: var(--muted);
   }
 
   button {
@@ -170,14 +177,20 @@
 </head>
 <body>
   <div class="card">
-    <h1>Scanned Document → Excel</h1>
-    <p class="subtitle">Upload a scanned PDF or image. We'll detect the table(s) and hand you back an .xlsx.</p>
+    <h1>Document Converter</h1>
+    <p class="subtitle">Upload a file, choose what to convert it to, and download the result.</p>
 
     <div id="dropzone">
       <p><strong>Click to choose a file</strong> or drag one here</p>
       <p id="file-name"></p>
     </div>
-    <input type="file" id="file-input" accept=".pdf,.png,.jpg,.jpeg,.tiff,.tif,.bmp">
+    <input type="file" id="file-input">
+
+    <div class="field" id="target-field">
+      <label for="target-select">Convert to</label>
+      <select id="target-select"></select>
+      <p id="target-help"></p>
+    </div>
 
     <div class="field" id="api-key-field">
       <label for="api-key">API key (only needed if the server requires one)</label>
@@ -187,7 +200,7 @@
     <button id="submit-btn" disabled>Convert</button>
 
     <div id="status" role="status" aria-live="polite"></div>
-    <a id="download-link" href="#">⬇ Download converted.xlsx</a>
+    <a id="download-link" href="#">⬇ Download result</a>
 
     <p class="footnote">
       Nothing is stored beyond what's needed to process your file.
@@ -200,12 +213,49 @@
   const dropzone = document.getElementById("dropzone");
   const fileInput = document.getElementById("file-input");
   const fileNameEl = document.getElementById("file-name");
+  const targetField = document.getElementById("target-field");
+  const targetSelect = document.getElementById("target-select");
+  const targetHelp = document.getElementById("target-help");
+  const apiKeyField = document.getElementById("api-key-field");
   const apiKeyInput = document.getElementById("api-key");
   const submitBtn = document.getElementById("submit-btn");
   const statusEl = document.getElementById("status");
   const downloadLink = document.getElementById("download-link");
 
   let selectedFile = null;
+
+  // Phase 2 completion (master directive numbering): frontend capability
+  // discovery. Everything about "what can this file become, and which
+  // extensions are acceptable at all" comes from the registry
+  // (documents_converter/registry.py) via GET /api/v1/capabilities,
+  // fetched once on load -- not hardcoded here. If the fetch fails (a
+  // network hiccup, an older server without the endpoint), the page
+  // still works: it falls back to accepting any file and always sending
+  // target=xlsx, which was this page's entire behavior before this
+  // capability existed.
+  let capabilities = [];
+
+  async function loadCapabilities() {
+    try {
+      const resp = await fetch("/api/v1/capabilities");
+      if (!resp.ok) return;
+      capabilities = await resp.json();
+      const allExtensions = [...new Set(capabilities.flatMap((c) => c.accepted_extensions))];
+      if (allExtensions.length) fileInput.accept = allExtensions.join(",");
+    } catch {
+      // Fall back silently -- see comment above.
+    }
+  }
+  loadCapabilities();
+
+  function extensionOf(filename) {
+    const i = filename.lastIndexOf(".");
+    return i === -1 ? "" : filename.slice(i).toLowerCase();
+  }
+
+  function capabilitiesForExtension(ext) {
+    return capabilities.filter((c) => c.accepted_extensions.includes(ext));
+  }
 
   dropzone.addEventListener("click", () => fileInput.click());
   dropzone.addEventListener("dragover", (e) => { e.preventDefault(); dropzone.classList.add("dragover"); });
@@ -223,8 +273,56 @@
     selectedFile = file;
     fileNameEl.textContent = file.name;
     fileNameEl.style.display = "block";
-    submitBtn.disabled = false;
+    populateTargets(file.name);
   }
+
+  function populateTargets(filename) {
+    const ext = extensionOf(filename);
+    const matches = capabilitiesForExtension(ext);
+
+    targetSelect.innerHTML = "";
+
+    if (!capabilities.length) {
+      // Capability discovery failed (see loadCapabilities) -- fall back
+      // to this page's original, single-target behavior rather than
+      // block the user on a feature that couldn't load.
+      targetField.classList.remove("visible");
+      submitBtn.disabled = false;
+      return;
+    }
+
+    if (!matches.length) {
+      targetField.classList.remove("visible");
+      submitBtn.disabled = true;
+      setStatus("error", `No conversion available for '${ext || "this file"}'.`);
+      return;
+    }
+
+    for (const cap of matches) {
+      const option = document.createElement("option");
+      option.value = cap.target_format;
+      option.textContent = cap.target_format.toUpperCase();
+      targetSelect.appendChild(option);
+    }
+    // A file this page already knows how to handle for OCR->Excel should
+    // still default to xlsx if that's one of the options, matching this
+    // page's original behavior -- new conversions (e.g. image->pdf) are
+    // discoverable via the dropdown, not forced on an existing workflow.
+    if (matches.some((c) => c.target_format === "xlsx")) {
+      targetSelect.value = "xlsx";
+    }
+    updateTargetHelp();
+    targetField.classList.add("visible");
+    submitBtn.disabled = false;
+    statusEl.className = "";
+    statusEl.textContent = "";
+  }
+
+  function updateTargetHelp() {
+    const match = capabilities.find((c) => c.target_format === targetSelect.value);
+    targetHelp.textContent = match ? match.description : "";
+  }
+  targetSelect.addEventListener("change", updateTargetHelp);
 
   // Icon prefixes pair with the semantic status classes above (CSS) so
   // color is never the only signal -- a person with a color-vision
@@ -260,6 +358,11 @@
     }
   }
 
+  function filenameFromDisposition(header, fallback) {
+    const match = /filename="?([^";]+)"?/.exec(header || "");
+    return match ? match[1] : fallback;
+  }
+
   async function downloadResult(jobId) {
     const resp = await fetch(`/api/v1/jobs/${jobId}/result`, { headers: authHeaders() });
     if (!resp.ok) {
@@ -269,7 +372,10 @@
     const blob = await resp.blob();
     const url = URL.createObjectURL(blob);
     downloadLink.href = url;
-    downloadLink.download = "converted.xlsx";
+    downloadLink.download = filenameFromDisposition(
+      resp.headers.get("Content-Disposition"),
+      "converted"
+    );
     downloadLink.style.display = "block";
     downloadLink.click();
   }
@@ -283,6 +389,9 @@
     try {
       const formData = new FormData();
       formData.append("file", selectedFile);
+      if (targetField.classList.contains("visible")) {
+        formData.append("target", targetSelect.value);
+      }
 
       const resp = await fetch("/api/v1/jobs", {
         method: "POST",

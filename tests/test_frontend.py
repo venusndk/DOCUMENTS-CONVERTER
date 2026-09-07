@@ -106,10 +106,15 @@ def test_frontend_full_upload_to_download_flow(running_app_server, synthetic_pdf
     assert rows[1][:5] == ("1", "100000001", "SMITH", "JOHN", "M")
 
 
-@requires_tesseract
-def test_frontend_shows_error_for_rejected_upload(running_app_server, tmp_path):
-    """A file the API rejects (bad extension) should surface a visible
-    error in the page, not fail silently or hang."""
+def test_frontend_rejects_unsupported_file_type_client_side(running_app_server, tmp_path):
+    """
+    Phase 2 completion (master directive numbering): frontend capability
+    discovery. An unsupported file type is now caught client-side, from
+    the real GET /api/v1/capabilities response -- before any network
+    request to /api/v1/jobs -- rather than only being caught by the
+    server's 400 after a real upload. Confirmed via a real browser: pick
+    a .exe, expect a visible error and a disabled Convert button.
+    """
     from playwright.sync_api import sync_playwright
 
     bad_file = tmp_path / "not_a_document.exe"
@@ -121,11 +126,91 @@ def test_frontend_shows_error_for_rejected_upload(running_app_server, tmp_path):
             page = browser.new_page()
             page.goto(running_app_server + "/")
             page.set_input_files("#file-input", str(bad_file))
-            page.locator("#submit-btn").click()
             status = page.locator("#status")
             page.wait_for_function(
                 "document.getElementById('status').className === 'error'", timeout=10_000
             )
-            assert "Unsupported file type" in status.inner_text()
+            assert "No conversion available" in status.inner_text()
+            assert page.locator("#submit-btn").is_disabled()
         finally:
             browser.close()
+
+
+def test_frontend_offers_a_target_choice_for_a_convertible_file(running_app_server, tmp_path):
+    """
+    A PNG genuinely matches two registered capabilities -- it could be a
+    photographed table (source_format=scanned_document, target=xlsx) or
+    a plain image someone wants containerized as a PDF
+    (source_format=image, target=pdf) -- so the dropdown, driven by the
+    real GET /api/v1/capabilities response, should offer both, defaulting
+    to xlsx (this page's original, pre-registry behavior) rather than
+    silently picking one and hiding the other.
+    """
+    from playwright.sync_api import sync_playwright
+    from PIL import Image
+
+    png_path = tmp_path / "photo.png"
+    Image.new("RGB", (50, 40), color=(10, 90, 200)).save(png_path)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(running_app_server + "/")
+            page.set_input_files("#file-input", str(png_path))
+            page.wait_for_function(
+                "document.getElementById('target-select').options.length > 0", timeout=10_000
+            )
+            options = page.locator("#target-select option").all_inner_texts()
+            assert set(options) == {"XLSX", "PDF"}
+            assert page.locator("#target-select").input_value() == "xlsx"
+            assert not page.locator("#submit-btn").is_disabled()
+        finally:
+            browser.close()
+
+
+def test_frontend_image_to_pdf_end_to_end(running_app_server, tmp_path):
+    """
+    The real proof this feature exists for: pick an image, explicitly
+    choose the "pdf" target from the capability-driven dropdown (not the
+    xlsx default), click Convert, and get back a real, valid,
+    correctly-sized PDF -- through the actual browser UI, not a direct
+    API call. No OCR/Tesseract involved, so this doesn't need
+    @requires_tesseract.
+    """
+    from playwright.sync_api import sync_playwright
+    from PIL import Image
+    import fitz
+
+    png_path = tmp_path / "photo.png"
+    Image.new("RGB", (120, 80), color=(200, 60, 60)).save(png_path)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(running_app_server + "/")
+            page.set_input_files("#file-input", str(png_path))
+            page.wait_for_function(
+                "document.getElementById('target-select').options.length > 0", timeout=10_000
+            )
+            page.select_option("#target-select", "pdf")
+            submit = page.locator("#submit-btn")
+            assert not submit.is_disabled()
+
+            with page.expect_download(timeout=30_000) as download_info:
+                submit.click()
+            download = download_info.value
+
+            saved_path = tmp_path / "downloaded.pdf"
+            download.save_as(str(saved_path))
+        finally:
+            browser.close()
+
+    doc = fitz.open(str(saved_path))
+    try:
+        assert doc.page_count == 1
+        assert doc[0].rect.width == 120
+        assert doc[0].rect.height == 80
+    finally:
+        doc.close()
