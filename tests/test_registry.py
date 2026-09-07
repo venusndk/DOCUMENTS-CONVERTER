@@ -98,10 +98,11 @@ def test_the_real_registry_has_no_ambiguous_pairs():
             assert found is not None
 
 
-def test_the_real_registry_has_the_two_phase_9_capabilities():
+def test_the_real_registry_has_the_registered_capabilities():
     from documents_converter import converters  # noqa: F401
     from documents_converter.registry import registry as real_registry
 
     pairs = {(c.source_format, c.target_format) for c in real_registry.list_all()}
     assert ("scanned_document", "xlsx") in pairs
     assert ("image", "pdf") in pairs
+    assert ("scanned_document", "searchable_pdf") in pairs

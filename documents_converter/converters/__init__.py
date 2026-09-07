@@ -12,7 +12,8 @@ edits to app.py's routing logic, which only ever asks the registry
 from __future__ import annotations
 
 from ..registry import registry
-from . import image_to_pdf, ocr_to_excel
+from . import image_to_pdf, ocr_to_excel, searchable_pdf
 
 registry.register(ocr_to_excel.CAPABILITY)
 registry.register(image_to_pdf.CAPABILITY)
+registry.register(searchable_pdf.CAPABILITY)

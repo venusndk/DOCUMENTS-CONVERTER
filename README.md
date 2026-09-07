@@ -31,6 +31,9 @@ documents_converter/
         ocr_to_excel.py               wraps the OCR pipeline above as a Capability
         image_to_pdf.py               image -> PDF (no OCR) -- the proof that the
                                       registry isn't OCR-only
+        searchable_pdf.py             scanned document -> searchable PDF (Phase 5
+                                      completion): original page image + invisible
+                                      OCR text layer
     api/
         app.py                       minimal synchronous HTTP API (see below)
         config.py                    environment-based API configuration
@@ -54,6 +57,7 @@ tests/
     test_jobs_db.py                    job store + migration unit tests
     test_storage.py                    storage abstraction unit tests
     test_document_analysis.py          document analysis unit tests
+    test_searchable_pdf.py             searchable-PDF conversion unit tests
     test_frontend.py                   real-browser (Playwright) frontend tests
     fixtures/synthetic_scan.py        generates a fabricated (no real data) test PDF
 docs/
@@ -188,12 +192,13 @@ without hardcoding another special case into the API layer (`if ext ==
 every conversion after the first). Both `/api/v1/convert` and
 `/api/v1/jobs` route through it via an optional `target` field.
 
-Two capabilities are registered today:
+Three capabilities are registered today:
 
-| source format      | target | accepts                                    | what it does                          |
-|---------------------|--------|---------------------------------------------|----------------------------------------|
-| `scanned_document`   | `xlsx` | `.pdf .png .jpg .jpeg .tiff .tif .bmp`      | the OCR + table-detection pipeline above |
-| `image`              | `pdf`  | `.png .jpg .jpeg .tiff .tif .bmp`           | plain image → single-page PDF, no OCR  |
+| source format      | target            | accepts                                | what it does                          |
+|---------------------|-------------------|------------------------------------------|----------------------------------------|
+| `scanned_document`   | `xlsx`            | `.pdf .png .jpg .jpeg .tiff .tif .bmp` | the OCR + table-detection pipeline above |
+| `image`              | `pdf`             | `.png .jpg .jpeg .tiff .tif .bmp`      | plain image → single-page PDF, no OCR  |
+| `scanned_document`   | `searchable_pdf`  | `.pdf .png .jpg .jpeg .tiff .tif .bmp` | original page image + invisible OCR text layer (Phase 5 completion) |
 
 `GET /api/v1/capabilities` reports this list live, from the registry
 itself, so it can't drift out of sync with what the server actually does:
@@ -207,6 +212,10 @@ Adding a new conversion means writing one new module under
 it in that package's `__init__.py` — nothing in `app.py`'s routing logic
 needs to change, since it only ever asks the registry "what handles this
 (extension, target) pair?" (`registry.find`, used by `app._resolve_capability`).
+Confirmed for real when `searchable_pdf` (Phase 5 completion) was added:
+the web page's target picker (Phase 2 completion, above) started
+offering it automatically, with zero frontend code changes, because it
+reads this same registry live instead of a hardcoded list.
 
 The master directive's Phase 2 also names "format definitions" and a
 separate "provider registry" alongside the capability registry and
@@ -344,6 +353,12 @@ curl.exe -F "file=@transcript.pdf" http://127.0.0.1:8000/api/v1/convert -o resul
 Synchronous example, a different target (the image->pdf capability):
 ```powershell
 curl.exe -F "target=pdf" -F "file=@photo.png" http://127.0.0.1:8000/api/v1/convert -o result.pdf
+```
+
+Synchronous example, searchable PDF (Phase 5 completion — same scanned
+document, now selectable/searchable/copyable text instead of a table):
+```powershell
+curl.exe -F "target=searchable_pdf" -F "file=@transcript.pdf" http://127.0.0.1:8000/api/v1/convert -o result.pdf
 ```
 
 Async example:

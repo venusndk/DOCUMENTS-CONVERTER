@@ -138,13 +138,18 @@ def test_frontend_rejects_unsupported_file_type_client_side(running_app_server, 
 
 def test_frontend_offers_a_target_choice_for_a_convertible_file(running_app_server, tmp_path):
     """
-    A PNG genuinely matches two registered capabilities -- it could be a
-    photographed table (source_format=scanned_document, target=xlsx) or
-    a plain image someone wants containerized as a PDF
-    (source_format=image, target=pdf) -- so the dropdown, driven by the
-    real GET /api/v1/capabilities response, should offer both, defaulting
-    to xlsx (this page's original, pre-registry behavior) rather than
-    silently picking one and hiding the other.
+    A PNG genuinely matches multiple registered capabilities -- it could
+    be a photographed table (source_format=scanned_document, target=xlsx
+    or target=searchable_pdf) or a plain image someone wants
+    containerized as a PDF (source_format=image, target=pdf) -- so the
+    dropdown, driven by the real GET /api/v1/capabilities response,
+    should offer all of them, defaulting to xlsx (this page's original,
+    pre-registry behavior) rather than silently picking one and hiding
+    the rest. Deliberately asserts the exact set rather than just "more
+    than one option": this page adding a new capability (as Phase 5
+    completion's searchable_pdf did, with zero frontend code changes)
+    should show up here automatically -- that's the point of driving
+    this from the registry instead of a hardcoded list.
     """
     from playwright.sync_api import sync_playwright
     from PIL import Image
@@ -162,7 +167,7 @@ def test_frontend_offers_a_target_choice_for_a_convertible_file(running_app_serv
                 "document.getElementById('target-select').options.length > 0", timeout=10_000
             )
             options = page.locator("#target-select option").all_inner_texts()
-            assert set(options) == {"XLSX", "PDF"}
+            assert set(options) == {"XLSX", "PDF", "SEARCHABLE_PDF"}
             assert page.locator("#target-select").input_value() == "xlsx"
             assert not page.locator("#submit-btn").is_disabled()
         finally:
