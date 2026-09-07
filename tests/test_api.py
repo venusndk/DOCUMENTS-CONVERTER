@@ -647,3 +647,39 @@ def test_analyze_emits_requested_and_completed_audit_events_without_raw_metadata
     # document_analysis.DocumentAnalysis's own docstring on why).
     assert "metadata" not in events[1]
     assert "width" not in events[1]
+
+
+# --------------------------------------------------------------------------
+# Phase 5 completion: target=searchable_pdf
+# (documents_converter/converters/searchable_pdf.py).
+# --------------------------------------------------------------------------
+
+
+def test_capabilities_endpoint_lists_searchable_pdf():
+    resp = client.get("/api/v1/capabilities")
+    pairs = {(c["source_format"], c["target_format"]) for c in resp.json()}
+    assert ("scanned_document", "searchable_pdf") in pairs
+
+
+@requires_tesseract
+def test_convert_to_searchable_pdf_end_to_end(synthetic_pdf, tesseract_cmd, monkeypatch):
+    """Real proof, through the actual sync endpoint: upload the
+    fabricated fixture, ask for target=searchable_pdf, and confirm the
+    returned file's text layer (read with PyMuPDF, not by re-running
+    OCR) contains the fixture's known fabricated text."""
+    monkeypatch.setattr(config, "TESSERACT_CMD", tesseract_cmd)
+    with open(synthetic_pdf, "rb") as f:
+        resp = client.post(
+            "/api/v1/convert",
+            data={"target": "searchable_pdf"},
+            files={"file": ("synthetic_scan.pdf", f, "application/pdf")},
+        )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/pdf"
+
+    doc = fitz.open(stream=resp.content, filetype="pdf")
+    try:
+        text = "\n".join(page.get_text() for page in doc).upper()
+    finally:
+        doc.close()
+    assert "SMITH" in text
