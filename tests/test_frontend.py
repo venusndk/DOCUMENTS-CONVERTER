@@ -74,9 +74,17 @@ def test_frontend_full_upload_to_download_flow(running_app_server, synthetic_pdf
     The real end-to-end proof: a real headless browser loads the actual
     page, selects the actual synthetic fixture through the actual file
     input, clicks the actual Convert button, and the actual polling/
-    download JavaScript in index.html produces a real file -- checked
-    against the same expected values as every other end-to-end test in
-    this project.
+    review/download JavaScript in index.html produces a real file --
+    checked against the same expected values as every other end-to-end
+    test in this project.
+
+    Phase 7 completion (master directive numbering) means an OCR->Excel
+    job always has review data (see documents_converter/api/jobs.py's
+    has_review), so the page shows the review step before downloading --
+    this test confirms/dismisses it with no edits, matching a user who
+    checks the data and finds nothing to fix. See
+    test_frontend_review_lets_a_person_correct_a_cell_before_downloading
+    below for the actual edit-a-cell path.
     """
     from playwright.sync_api import sync_playwright
 
@@ -90,9 +98,17 @@ def test_frontend_full_upload_to_download_flow(running_app_server, synthetic_pdf
             page.set_input_files("#file-input", str(synthetic_pdf))
             submit = page.locator("#submit-btn")
             assert not submit.is_disabled()
+            submit.click()
 
-            with page.expect_download(timeout=60_000) as download_info:
-                submit.click()
+            confirm_btn = page.locator("#confirm-download-btn")
+            page.wait_for_function(
+                "document.getElementById('review-field').classList.contains('visible')",
+                timeout=60_000,
+            )
+            assert page.locator(".review-table td").count() > 0
+
+            with page.expect_download(timeout=30_000) as download_info:
+                confirm_btn.click()
             download = download_info.value
 
             saved_path = tmp_path / "downloaded.xlsx"
@@ -104,6 +120,54 @@ def test_frontend_full_upload_to_download_flow(running_app_server, synthetic_pdf
     ws = wb[wb.sheetnames[0]]
     rows = list(ws.iter_rows(values_only=True))
     assert rows[1][:5] == ("1", "100000001", "SMITH", "JOHN", "M")
+
+
+@requires_tesseract
+def test_frontend_review_lets_a_person_correct_a_cell_before_downloading(
+    running_app_server, synthetic_pdf, tmp_path
+):
+    """
+    The actual point of Phase 7 completion: edit a cell in the rendered
+    review table (not just accept it as-is), confirm, and check the
+    correction reached the downloaded file -- through the real
+    contenteditable UI, not by calling the API directly.
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(running_app_server + "/")
+            page.set_input_files("#file-input", str(synthetic_pdf))
+            page.locator("#submit-btn").click()
+
+            page.wait_for_function(
+                "document.getElementById('review-field').classList.contains('visible')",
+                timeout=60_000,
+            )
+
+            first_cell = page.locator(".review-table td").first
+            assert first_cell.inner_text() == "S/N"
+            first_cell.click()
+            page.keyboard.press("Control+A")
+            page.keyboard.type("EDITED")
+            # Blur the cell so the browser commits the contenteditable
+            # edit before collectCorrections() reads it.
+            page.locator("#review-help").click()
+
+            with page.expect_download(timeout=30_000) as download_info:
+                page.locator("#confirm-download-btn").click()
+            download = download_info.value
+
+            saved_path = tmp_path / "downloaded.xlsx"
+            download.save_as(str(saved_path))
+        finally:
+            browser.close()
+
+    wb = openpyxl.load_workbook(saved_path)
+    ws = wb[wb.sheetnames[0]]
+    assert ws.cell(row=1, column=1).value == "EDITED"
 
 
 def test_frontend_rejects_unsupported_file_type_client_side(running_app_server, tmp_path):

@@ -52,6 +52,11 @@ class Job:
     # that created it has returned, so cleanup happens on a retention
     # timer (JobStore._cleanup_expired) instead.
     work_dir: Path | None = None
+    # Set only for jobs whose capability produced a review artifact
+    # (currently just OCR->Excel -- see converters/ocr_to_excel.py).
+    # None for every other capability's jobs. Master directive Phase 7
+    # completion's "preview"/"human review" support.
+    review_path: Path | None = None
 
     @classmethod
     def _from_record(cls, record: JobRecord) -> Job:
@@ -64,6 +69,7 @@ class Job:
             result_media_type=record.result_media_type,
             result_filename=record.result_filename,
             work_dir=Path(record.work_dir) if record.work_dir else None,
+            review_path=Path(record.review_path) if record.review_path else None,
         )
 
 

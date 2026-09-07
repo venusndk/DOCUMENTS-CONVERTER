@@ -36,6 +36,7 @@ System dependency:
         Windows:       https://github.com/oschwartz10612/poppler-windows
 """
 
+import json
 import os
 import re
 import sys
@@ -343,24 +344,35 @@ def _is_suspicious(value) -> bool:
     return any(pat.search(value) for pat in _SUSPICIOUS_PATTERNS)
 
 
-def _write_table_flagged(table, sheet, normal_fmt, flag_fmt) -> int:
+def _write_table_flagged(table, sheet, normal_fmt, flag_fmt) -> tuple[int, list[dict]]:
     """
     Writes a table's cells directly (one cell per column position, rather
     than img2table's merge_range-based writer) so each cell can get its own
     format -- flagged cells get a highlighted background so a human
     reviewer can find exactly what to double-check, instead of the file
     silently presenting uncertain OCR output as if it were verified.
-    Returns the number of cells flagged.
+
+    Returns (flagged_count, rows) -- `rows` is a JSON-serializable
+    snapshot of exactly what was written, one entry per row with explicit
+    row/column indices (master directive Phase 7 completion: "preview"
+    and "human review" -- documents_converter/api/app.py's
+    GET/POST /jobs/{id}/review use this same row_index/col_index
+    addressing to read and correct cells without re-parsing the .xlsx).
     """
     flagged = 0
+    rows = []
     for row_idx, cells in table.content.items():
+        row_cells = []
         for col_idx, cell in enumerate(cells):
             suspicious = _is_suspicious(cell.value)
             sheet.write(row_idx, col_idx, cell.value, flag_fmt if suspicious else normal_fmt)
             if suspicious:
                 flagged += 1
+            row_cells.append({"col_index": col_idx, "value": cell.value, "suspicious": suspicious})
+        rows.append({"row_index": row_idx, "cells": row_cells})
     sheet.autofit()
-    return flagged
+    rows.sort(key=lambda r: r["row_index"])
+    return flagged, rows
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
@@ -426,6 +438,7 @@ def convert_scanned_to_excel(
     flag_suspicious_cells: bool = True,
     auto_detect_mode: bool = True,
     progress: Callable[[str], None] = print,
+    review_json_path: str | None = None,
 ) -> str:
     """
     Detects file type (image / scanned PDF / text PDF) and exports detected
@@ -435,6 +448,13 @@ def convert_scanned_to_excel(
         each pipeline stage. Defaults to `print` (matching this function's
         original CLI-only behavior); pass something else (e.g. a job's log
         appender) to use this from a non-CLI caller without scraping stdout.
+    :param review_json_path: if given, also writes a JSON snapshot of
+        every written cell (value + suspicious flag, addressed by sheet
+        name and row/col index) to this path -- master directive Phase 7
+        completion's "preview"/"human review" support. `None` (the
+        default) preserves this function's exact original behavior for
+        every existing caller (the CLI, and callers that never asked for
+        review data).
     """
     if not check_tesseract_available(tesseract_cmd):
         raise EnvironmentError(
@@ -541,14 +561,23 @@ def convert_scanned_to_excel(
     flag_format.set_border()
 
     total_flagged = 0
+    review_tables = []
     for page, tables in extracted_tables.items():
         for idx, table in enumerate(tables):
-            sheet = workbook.add_worksheet(name=f"Page {page + 1} - Table {idx + 1}")
+            sheet_name = f"Page {page + 1} - Table {idx + 1}"
+            sheet = workbook.add_worksheet(name=sheet_name)
             if flag_suspicious_cells:
-                total_flagged += _write_table_flagged(table, sheet, cell_format, flag_format)
+                flagged, rows = _write_table_flagged(table, sheet, cell_format, flag_format)
+                total_flagged += flagged
+                if review_json_path:
+                    review_tables.append({"sheet_name": sheet_name, "rows": rows})
             else:
                 table._to_worksheet(sheet=sheet, cell_fmt=cell_format)
     workbook.close()
+
+    if review_json_path:
+        with open(review_json_path, "w", encoding="utf-8") as f:
+            json.dump({"tables": review_tables}, f)
 
     if flag_suspicious_cells and total_flagged:
         progress(

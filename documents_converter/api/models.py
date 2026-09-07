@@ -30,3 +30,8 @@ class JobRecord(Base):
         String(255), nullable=False, default="converted.xlsx"
     )
     work_dir: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Set only for jobs whose capability produced a review artifact
+    # (currently just OCR->Excel -- see converters/ocr_to_excel.py) --
+    # master directive Phase 7 completion's "preview"/"human review"
+    # support. NULL for every other capability's jobs.
+    review_path: Mapped[str | None] = mapped_column(Text, nullable=True)

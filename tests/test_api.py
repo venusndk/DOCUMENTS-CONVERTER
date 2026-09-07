@@ -683,3 +683,108 @@ def test_convert_to_searchable_pdf_end_to_end(synthetic_pdf, tesseract_cmd, monk
     finally:
         doc.close()
     assert "SMITH" in text
+
+
+# --------------------------------------------------------------------------
+# Phase 7 completion: preview + human review
+# (GET/POST /api/v1/jobs/{id}/review).
+# --------------------------------------------------------------------------
+
+
+def test_job_status_reports_has_review_false_for_non_ocr_targets():
+    resp = client.post(
+        "/api/v1/jobs",
+        data={"target": "pdf"},
+        files={"file": ("photo.png", io.BytesIO(_sample_png_bytes()), "image/png")},
+    )
+    job_id = resp.json()["job_id"]
+    _wait_for_job_terminal(job_id)
+
+    status = client.get(f"/api/v1/jobs/{job_id}").json()
+    assert status["has_review"] is False
+
+    review_resp = client.get(f"/api/v1/jobs/{job_id}/review")
+    assert review_resp.status_code == 404
+
+
+@requires_tesseract
+def test_ocr_job_review_lifecycle_and_correction_reaches_the_xlsx(
+    synthetic_pdf, tesseract_cmd, monkeypatch
+):
+    """
+    The real end-to-end proof: submit a real OCR job, confirm
+    has_review=True and the review data matches the known fixture
+    values, deliberately corrupt one cell via POST .../review, and
+    confirm the correction landed in BOTH a fresh GET .../review AND the
+    actual downloaded .xlsx -- not just accepted with a 200.
+    """
+    monkeypatch.setattr(config, "TESSERACT_CMD", tesseract_cmd)
+    with open(synthetic_pdf, "rb") as f:
+        resp = client.post(
+            "/api/v1/jobs", files={"file": ("synthetic_scan.pdf", f, "application/pdf")}
+        )
+    job_id = resp.json()["job_id"]
+    assert _wait_for_job_terminal(job_id) == "completed"
+
+    status = client.get(f"/api/v1/jobs/{job_id}").json()
+    assert status["has_review"] is True
+
+    review = client.get(f"/api/v1/jobs/{job_id}/review").json()
+    assert len(review["tables"]) == 1
+    table = review["tables"][0]
+    header_row = next(r for r in table["rows"] if r["row_index"] == 0)
+    assert header_row["cells"][0]["value"] == "S/N"
+
+    correction_resp = client.post(
+        f"/api/v1/jobs/{job_id}/review",
+        json=[
+            {
+                "sheet_name": table["sheet_name"],
+                "row_index": 0,
+                "col_index": 0,
+                "value": "CORRECTED",
+            }
+        ],
+    )
+    assert correction_resp.status_code == 200
+    assert correction_resp.json()["applied"] == 1
+
+    updated_review = client.get(f"/api/v1/jobs/{job_id}/review").json()
+    updated_header = next(
+        r for r in updated_review["tables"][0]["rows"] if r["row_index"] == 0
+    )
+    assert updated_header["cells"][0]["value"] == "CORRECTED"
+    assert updated_header["cells"][0]["suspicious"] is False
+
+    result_resp = client.get(f"/api/v1/jobs/{job_id}/result")
+    wb = openpyxl.load_workbook(io.BytesIO(result_resp.content))
+    ws = wb[table["sheet_name"]]
+    assert ws.cell(row=1, column=1).value == "CORRECTED"
+
+
+@requires_tesseract
+def test_review_rejects_a_correction_for_an_unknown_cell(synthetic_pdf, tesseract_cmd, monkeypatch):
+    monkeypatch.setattr(config, "TESSERACT_CMD", tesseract_cmd)
+    with open(synthetic_pdf, "rb") as f:
+        resp = client.post(
+            "/api/v1/jobs", files={"file": ("synthetic_scan.pdf", f, "application/pdf")}
+        )
+    job_id = resp.json()["job_id"]
+    _wait_for_job_terminal(job_id)
+
+    resp = client.post(
+        f"/api/v1/jobs/{job_id}/review",
+        json=[{"sheet_name": "Nonexistent Sheet", "row_index": 0, "col_index": 0, "value": "x"}],
+    )
+    assert resp.status_code == 400
+
+
+def test_review_endpoints_404_for_unknown_job():
+    assert client.get("/api/v1/jobs/does-not-exist/review").status_code == 404
+    assert (
+        client.post(
+            "/api/v1/jobs/does-not-exist/review",
+            json=[{"sheet_name": "x", "row_index": 0, "col_index": 0, "value": "x"}],
+        ).status_code
+        == 404
+    )

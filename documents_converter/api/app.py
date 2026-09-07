@@ -66,6 +66,7 @@ Run locally:
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -73,8 +74,10 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import openpyxl
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from openpyxl.styles import PatternFill
 from PIL import Image as PILImage
 
 import fitz
@@ -87,7 +90,7 @@ from .rate_limit import FixedWindowRateLimiter
 from .storage import storage
 from .. import converters  # noqa: F401 -- import for its registration side effect only
 from ..document_analysis import analyze
-from ..ocr_excel import check_tesseract_available
+from ..ocr_excel import _is_suspicious, check_tesseract_available
 from ..registry import Capability, registry
 
 
@@ -535,7 +538,18 @@ def _run_job(
             output_path,
             progress=lambda msg: print(f"[{request_id}] {msg}"),
         )
-        _job_store.update(job.id, status="completed", result_path=output_path)
+        # A sibling file next to output_path, not something every
+        # capability announces explicitly -- see converters/
+        # ocr_to_excel.py's own note on why. Only OCR->Excel jobs
+        # produce one today; every other capability's jobs get
+        # review_path=None, and the review endpoints below 404 for those.
+        review_path = output_path.parent / f"{output_path.stem}.review.json"
+        _job_store.update(
+            job.id,
+            status="completed",
+            result_path=output_path,
+            review_path=review_path if review_path.exists() else None,
+        )
         audit.log_event(
             "job_completed",
             request_id=request_id,
@@ -620,7 +634,11 @@ def get_job_status(job_id: str) -> dict:
     job = _job_store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
-    body = {"job_id": job.id, "status": job.status}
+    # has_review (Phase 7 completion, master directive numbering) lets a
+    # caller know whether GET/POST .../review are worth calling at all,
+    # without a separate probe request that would 404 for most jobs
+    # (only OCR->Excel produces review data).
+    body = {"job_id": job.id, "status": job.status, "has_review": job.review_path is not None}
     if job.error:
         body["error"] = job.error
     return body
@@ -640,6 +658,97 @@ def get_job_result(job_id: str) -> Response:
         media_type=job.result_media_type,
         headers={"Content-Disposition": f"attachment; filename={job.result_filename}"},
     )
+
+
+@app.get("/api/v1/jobs/{job_id}/review", dependencies=[Depends(require_api_key)])
+def get_job_review(job_id: str) -> dict:
+    """
+    Master directive Phase 7 completion: "preview" and "human review".
+    Returns the structured table data a completed OCR->Excel job
+    produced (documents_converter/converters/ocr_to_excel.py's
+    review_json_path), one entry per detected table with every cell's
+    value and suspicious flag -- lets a caller show, and let a person
+    correct, the extracted data before trusting or downloading the final
+    file. 404 for a job with no review data (any non-OCR->Excel target,
+    or a job that hasn't reached "completed") rather than an empty or
+    misleading response.
+    """
+    job = _job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job.review_path is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No review data for this job (only available for OCR-to-Excel conversions).",
+        )
+    return json.loads(job.review_path.read_text(encoding="utf-8"))
+
+
+@app.post("/api/v1/jobs/{job_id}/review", dependencies=[Depends(require_api_key)])
+def submit_job_review(job_id: str, corrections: list[dict]) -> dict:
+    """
+    Applies human corrections to a completed OCR->Excel job's cells --
+    to both the stored review JSON (so a later GET reflects them) and
+    the actual .xlsx result (so a later download does too). A corrected
+    cell whose new value no longer looks suspicious (re-checked with the
+    same documents_converter.ocr_excel._is_suspicious this project's
+    Excel output itself uses) has its highlight cleared -- a person who
+    fixed a flagged cell shouldn't see it still marked as uncertain.
+
+    Each correction: {"sheet_name": str, "row_index": int,
+    "col_index": int, "value": str} -- the same addressing the GET above
+    returns cells with, which is also exactly what xlsxwriter wrote the
+    .xlsx cell at (documents_converter/ocr_excel.py's
+    _write_table_flagged).
+    """
+    job = _job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job.review_path is None:
+        raise HTTPException(status_code=404, detail="No review data for this job.")
+
+    review = json.loads(job.review_path.read_text(encoding="utf-8"))
+    tables_by_name = {t["sheet_name"]: t for t in review["tables"]}
+    workbook = openpyxl.load_workbook(job.result_path)
+
+    applied = 0
+    for correction in corrections:
+        sheet_name = correction.get("sheet_name")
+        row_index = correction.get("row_index")
+        col_index = correction.get("col_index")
+        value = correction.get("value")
+
+        table = tables_by_name.get(sheet_name)
+        if table is None or sheet_name not in workbook.sheetnames:
+            raise HTTPException(status_code=400, detail=f"Unknown sheet '{sheet_name}'.")
+        row_entry = next((r for r in table["rows"] if r["row_index"] == row_index), None)
+        if row_entry is None:
+            raise HTTPException(
+                status_code=400, detail=f"Unknown row {row_index} in '{sheet_name}'."
+            )
+        cell_entry = next((c for c in row_entry["cells"] if c["col_index"] == col_index), None)
+        if cell_entry is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown cell (row {row_index}, col {col_index}) in '{sheet_name}'.",
+            )
+
+        cell_entry["value"] = value
+        cell_entry["suspicious"] = _is_suspicious(value)
+
+        # openpyxl is 1-indexed; row_index/col_index are the same
+        # 0-indexed coordinates xlsxwriter originally wrote at.
+        xlsx_cell = workbook[sheet_name].cell(row=row_index + 1, column=col_index + 1)
+        xlsx_cell.value = value
+        if not cell_entry["suspicious"]:
+            xlsx_cell.fill = PatternFill(fill_type=None)
+        applied += 1
+
+    workbook.save(job.result_path)
+    job.review_path.write_text(json.dumps(review), encoding="utf-8")
+
+    audit.log_event("review_corrections_applied", job_id=job.id, count=applied)
+    return {"applied": applied}
 
 
 @app.exception_handler(Exception)
