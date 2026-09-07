@@ -38,6 +38,7 @@ documents_converter/
         jobs.py                      database-backed async job store (Phase 1 completion)
         db.py                        SQLAlchemy engine/session setup (SQLite or Postgres)
         models.py                    ORM models (JobRecord)
+        storage.py                   scratch-workspace allocation/cleanup (Phase 3 completion)
         audit.py                     structured audit trail (Phase 11)
         static/index.html            the web page -- upload, convert, download
 migrations/                          Alembic migrations (Phase 1 completion)
@@ -49,6 +50,7 @@ tests/
     test_api.py                        API tests
     test_audit.py                      audit trail + startup-guard unit tests
     test_jobs_db.py                    job store + migration unit tests
+    test_storage.py                    storage abstraction unit tests
     test_frontend.py                   real-browser (Playwright) frontend tests
     fixtures/synthetic_scan.py        generates a fabricated (no real data) test PDF
 docs/
@@ -381,6 +383,16 @@ naming, no document-content logging), the API also has:
 - **No leaked stack traces** — a catch-all exception handler guarantees
   any unexpected error returns a generic message, regardless of what
   actually went wrong.
+- **Storage abstraction** (master directive Phase 3 completion,
+  `documents_converter/api/storage.py`) — every scratch directory an
+  upload, a synchronous conversion, or an async job reads and writes
+  real files in is now allocated/released through one seam instead of
+  `tempfile`/`shutil` calls scattered across `app.py` and `jobs.py`.
+  Same on-disk behavior as before (one backend, `LocalDiskStorage`,
+  ships today) — the point is a future backend (e.g. one that also
+  syncs to S3, for results that need to outlive a single container)
+  can be swapped in behind this one interface instead of touching every
+  call site.
 - **Production startup guard** (Phase 11) — see Authentication above.
 - **Audit trail** (Phase 11, `documents_converter/api/audit.py`) — every
   conversion attempt (`/convert` and `/jobs`) writes a structured JSON-line
