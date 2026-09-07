@@ -65,3 +65,16 @@ ENVIRONMENT: str = os.environ.get("ENVIRONMENT", "development")
 # that wants that record to outlive the container without standing up a
 # database just for this.
 AUDIT_LOG_PATH: str | None = os.environ.get("AUDIT_LOG_PATH") or None
+
+# Phase 1 completion (master directive numbering -- see
+# documents_converter/api/db.py): the project's persistence layer.
+# Defaults to a local SQLite file so a fresh checkout keeps working with
+# zero extra infrastructure, same as every other default in this file;
+# point this at a real Postgres instance (e.g.
+# "postgresql+psycopg://user:pass@host:5432/dbname") for a deployment
+# that needs jobs to survive a restart and be visible across more than
+# one replica. Both are real, tested backends -- not "SQLite for dev,
+# Postgres someday" -- see tests/test_jobs_db.py.
+DATABASE_URL: str = os.environ.get(
+    "DATABASE_URL", "sqlite:///./data/documents_converter.db"
+)

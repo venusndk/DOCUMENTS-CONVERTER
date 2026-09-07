@@ -22,12 +22,23 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements-api.txt
 # CLI's own dev-only files.
 COPY documents_converter/ documents_converter/
 
+# Phase 1 completion (master directive numbering): Alembic migration
+# files, run automatically at startup (see api/app.py's _run_migrations,
+# called from the FastAPI lifespan handler).
+COPY alembic.ini alembic.ini
+COPY migrations/ migrations/
+
 # Phase 11 (docs/PHASE_0_AUDIT.md numbering continued): run as an
 # unprivileged user rather than the container default (root). The app
 # never needs root -- it only reads its own code and writes to per-request
 # temp directories (Python's tempfile module defaults to a world-writable
-# /tmp, which appuser can use without owning /app).
-RUN useradd --create-home --shell /usr/sbin/nologin appuser
+# /tmp, which appuser can use without owning /app) and, as of Phase 1
+# completion, to ./data/ for the default local SQLite database -- created
+# and chowned here since appuser can't create new directories under /app
+# itself (owned by root, since WORKDIR ran before this point).
+RUN useradd --create-home --shell /usr/sbin/nologin appuser \
+    && mkdir -p /app/data \
+    && chown appuser:appuser /app/data
 USER appuser
 
 EXPOSE 8000

@@ -35,15 +35,20 @@ documents_converter/
         security.py                  magic-byte + decompression-bomb checks
         rate_limit.py                per-IP fixed-window rate limiter
         auth.py                      API-key authentication
-        jobs.py                      in-memory async job store
+        jobs.py                      database-backed async job store (Phase 1 completion)
+        db.py                        SQLAlchemy engine/session setup (SQLite or Postgres)
+        models.py                    ORM models (JobRecord)
         audit.py                     structured audit trail (Phase 11)
         static/index.html            the web page -- upload, convert, download
+migrations/                          Alembic migrations (Phase 1 completion)
+alembic.ini
 tests/
     conftest.py
     test_ocr_excel.py                 pipeline/provider regression tests
     test_registry.py                   capability registry unit tests
     test_api.py                        API tests
     test_audit.py                      audit trail + startup-guard unit tests
+    test_jobs_db.py                    job store + migration unit tests
     test_frontend.py                   real-browser (Playwright) frontend tests
     fixtures/synthetic_scan.py        generates a fabricated (no real data) test PDF
 docs/
@@ -195,6 +200,33 @@ $env:TESSERACT_CMD = "C:\Program Files\Tesseract-OCR\tesseract.exe"
 uvicorn documents_converter.api.app:app --reload
 ```
 
+The job store persists to a real database (`documents_converter/api/db.py`,
+`jobs.py`; Phase 1 completion, master directive numbering) instead of an
+in-memory dict — jobs now survive a restart, and, with a shared Postgres
+instance, are visible across more than one replica. `DATABASE_URL`
+defaults to a local SQLite file (`./data/documents_converter.db`), so the
+command above needs no extra setup; point it at Postgres instead for that:
+
+```powershell
+$env:DATABASE_URL = "postgresql+psycopg://user:pass@localhost:5432/documents_converter"
+```
+
+Migrations (Alembic, `alembic.ini` + `migrations/`) run automatically at
+startup against whichever `DATABASE_URL` is configured — no separate
+manual step for local/dev use. To run them by hand instead (e.g. as an
+explicit release step before rolling out a change to more than one
+replica, so they don't race each other migrating on boot):
+
+```powershell
+alembic upgrade head
+```
+
+Verified against both backends for real, not just assumed compatible via
+the ORM: ran the actual migration, started the real API, submitted a job,
+killed the process, and confirmed a **brand-new process** could still see
+the completed job — against a real local SQLite file and, separately,
+against a real disposable Postgres container.
+
 ```
 GET  /health                    -> {"status": "ok", "tesseract_available": true}
 GET  /api/v1/capabilities       -> what conversions are registered (see above)
@@ -244,17 +276,20 @@ same validation and the same worker pool — see `documents_converter/api/app.py
 module docstring for the resulting known limitation (heavy async load
 can delay sync requests).
 
-The job store (`documents_converter/api/jobs.py`) is in-memory, the same
-honest limitation as the rate limiter below: correct for a single-process
-deployment, but jobs don't survive a restart and aren't visible across
-multiple replicas. Finished jobs' files are cleaned up after
-`JOB_RETENTION_SECONDS` (default: 1 hour).
+The job store (`documents_converter/api/jobs.py`) is database-backed as
+of Phase 1 completion (see above) -- jobs survive a restart, and with a
+shared Postgres instance are visible across multiple replicas too. The
+worker pool that actually runs conversions (`_convert_executor`) is still
+in-process, though, so multiple replicas still each need their own; only
+the job *records* (status, result location) are shared. Finished jobs'
+files are cleaned up after `JOB_RETENTION_SECONDS` (default: 1 hour).
 
 Configuration (environment variables, see `documents_converter/api/config.py`):
 `TESSERACT_CMD` (default: none, i.e. must be on `PATH`), `MAX_UPLOAD_MB`
 (default: 50), `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS`
 (default: 10 requests per 60s per client IP), `CONVERT_TIMEOUT_SECONDS`
-(default: 180), `JOB_RETENTION_SECONDS` (default: 3600), `API_KEYS`
+(default: 180), `JOB_RETENTION_SECONDS` (default: 3600), `DATABASE_URL`
+(default: local SQLite), `API_KEYS`
 (default: empty, i.e. auth off — see below), `ENVIRONMENT` and
 `AUDIT_LOG_PATH` (Phase 11, see Security hardening below).
 
@@ -355,6 +390,18 @@ than root — confirmed with `docker exec ... whoami` against a real running
 container, not just read from the Dockerfile — and declares a
 `HEALTHCHECK` against `/health` so an orchestrator can detect a wedged
 container, not only a crashed one.
+
+The default `DATABASE_URL` (local SQLite at `/app/data/documents_converter.db`
+inside the container) lives on the container's own writable layer, which
+is discarded when the container is removed -- mount a volume at `/app/data`
+if you want that file to survive `docker rm`, or set `DATABASE_URL` to a
+real Postgres instance instead:
+
+```powershell
+docker run -p 8000:8000 -v documents-converter-data:/app/data documents-converter-api
+# or:
+docker run -p 8000:8000 -e DATABASE_URL="postgresql+psycopg://user:pass@host:5432/db" documents-converter-api
+```
 
 ## Continuous integration
 

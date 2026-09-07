@@ -11,12 +11,15 @@ Phase 7 added a genuine async path (POST /api/v1/jobs, GET
 /api/v1/jobs/{id}, GET /api/v1/jobs/{id}/result) for callers who don't
 want to hold a connection open for a slow OCR run: submit returns
 immediately with a job id, the actual conversion runs in the background,
-and the caller polls for status. See jobs.py for the in-memory job store
-and its own documented single-process limitation. Both paths share the
-same validation (_validate_and_save_upload, _check_decompression_bomb)
-and the same worker pool (_convert_executor) -- documented as a known
-limitation in docs/PHASE_0_AUDIT.md: heavy async job load could delay
-sync requests, since they compete for the same 4 worker threads.
+and the caller polls for status. See jobs.py for the job store -- Phase 1
+completion (master directive numbering) moved it from an in-memory dict
+to a real database (db.py, models.py, migrations/), so jobs now survive
+a restart. Both paths still share the same validation
+(_validate_and_save_upload, _check_decompression_bomb) and the same
+worker pool (_convert_executor) -- documented as a known limitation in
+docs/PHASE_0_AUDIT.md: heavy async job load could delay sync requests,
+since they compete for the same 4 worker threads, and that pool itself
+is still per-process (only the job *records* are now shared/durable).
 
 Phase 4 added security hardening on top of Phase 3's basic hygiene
 (extension allowlist, safe temp-file naming, no document-content
@@ -67,11 +70,38 @@ import fitz
 
 from . import audit, config, security
 from .auth import require_api_key
+from .db import check_db_connection
 from .jobs import Job, JobStore
 from .rate_limit import FixedWindowRateLimiter
 from .. import converters  # noqa: F401 -- import for its registration side effect only
 from ..ocr_excel import check_tesseract_available
 from ..registry import Capability, registry
+
+
+def _run_migrations() -> None:
+    """
+    Applies any pending Alembic migrations against config.DATABASE_URL at
+    startup, so a fresh checkout (or a fresh container against a fresh
+    database) doesn't need a separate manual `alembic upgrade head` step
+    to become usable -- consistent with this project's running "zero
+    extra setup" bar for local/dev use.
+
+    Idempotent (upgrading an already-current database is a no-op), which
+    matters here since this runs every time the process starts, not just
+    once. For a deployment that runs multiple replicas against the same
+    database, running migrations as an explicit separate release step
+    instead (skip calling this, run `alembic upgrade head` once before
+    rolling out) avoids every replica racing to migrate on boot --
+    tracked as a known simplification for this single-instance-shaped
+    project, not silently assumed away.
+    """
+    from alembic import command
+    from alembic.config import Config as AlembicConfig
+
+    repo_root = Path(__file__).resolve().parents[2]
+    cfg = AlembicConfig(str(repo_root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(repo_root / "migrations"))
+    command.upgrade(cfg, "head")
 
 
 def _check_startup_config() -> None:
@@ -104,6 +134,7 @@ def _check_startup_config() -> None:
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    _run_migrations()
     _check_startup_config()
     yield
 
@@ -147,11 +178,14 @@ def health() -> dict:
     Liveness/readiness check. Reports whether Tesseract is actually
     reachable (not just that the process is up) -- a health check that
     only proves the web server started is not very useful for an OCR
-    service whose real dependency is an external binary.
+    service whose real dependency is an external binary. Phase 1
+    completion added a real database round trip alongside it, for the
+    same reason: the job store now depends on it being reachable.
     """
     return {
         "status": "ok",
         "tesseract_available": check_tesseract_available(config.TESSERACT_CMD),
+        "database_available": check_db_connection(),
     }
 
 
