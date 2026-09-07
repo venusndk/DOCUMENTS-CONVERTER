@@ -14,6 +14,8 @@ documents_converter/
     ocr_excel.py                     pipeline orchestration (file-type detection,
                                       calling the providers below in order, writing
                                       the .xlsx, the Excel/img2table bugfix patches)
+    document_analysis.py             per-page digital/scanned/mixed classification,
+                                      safe metadata, quality flags (Phase 4 completion)
     providers/
         cell_ocr.py                  CellOCRProvider: recognizes text in one
                                       already-cropped cell image (used by the
@@ -51,6 +53,7 @@ tests/
     test_audit.py                      audit trail + startup-guard unit tests
     test_jobs_db.py                    job store + migration unit tests
     test_storage.py                    storage abstraction unit tests
+    test_document_analysis.py          document analysis unit tests
     test_frontend.py                   real-browser (Playwright) frontend tests
     fixtures/synthetic_scan.py        generates a fabricated (no real data) test PDF
 docs/
@@ -220,6 +223,36 @@ for the same capability becomes a real need (a cloud OCR fallback
 alongside Tesseract, say), that's the point to introduce the
 provider/capability split for real, not before.
 
+## Document analysis (Phase 4 completion)
+
+`documents_converter/document_analysis.py` inspects a PDF or image and
+reports, before any conversion runs:
+
+- **Classification** — for PDFs, every page is checked for a real text
+  layer (not just the first few, and not a whole-document guess): all
+  digital pages → `digital`, all scanned → `scanned`, a genuine
+  combination → `mixed`. Images are always `image` (a raster has no
+  "native" text layer to check).
+- **Safe metadata** — PDF producer/creator/creation-date/encrypted flag,
+  or image format/mode/dimensions/DPI. Returned to the caller (it's
+  their own file) but deliberately never written to the audit trail —
+  these fields can occasionally carry a real person's name, and this
+  project's logging policy (see Risk Register in `docs/PHASE_0_AUDIT.md`)
+  is that server-side logs never carry anything read from inside a
+  document.
+- **Quality flags** — deliberately conservative: only conditions with a
+  direct, mechanical link to a real problem (`no_pages`,
+  `very_low_resolution`), not a tuned prediction of OCR accuracy. This
+  project's own tested experience (see the `--dpi`/`--preprocess` note
+  further down) is that plausible-sounding image-quality heuristics did
+  not actually predict OCR outcomes on the one real document tested
+  against — an elaborate, unvalidated quality *score* would repeat that
+  mistake, not fix it.
+
+Exposed via `POST /api/v1/analyze` (see below) — independent of
+`/convert`/`/jobs`, so a caller (or a future frontend feature) can
+inspect a file before committing to a conversion.
+
 ## HTTP API (optional)
 
 An API wraps the registry above, for anything that needs to call this over
@@ -265,6 +298,10 @@ against a real disposable Postgres container.
 GET  /health                    -> {"status": "ok", "tesseract_available": true}
 GET  /api/v1/capabilities       -> what conversions are registered (see above)
 
+POST /api/v1/analyze            -> upload a file, get back its page-level digital/
+                                    scanned/mixed classification, safe metadata, and
+                                    quality flags -- no conversion runs. See below.
+
 POST /api/v1/convert            -> synchronous: upload a file (multipart/form-data,
                                     field name "file") and optionally "target" (a
                                     target format from /api/v1/capabilities; defaults
@@ -281,6 +318,22 @@ GET  /api/v1/jobs/{id}           -> {"job_id": "...", "status": "queued|processi
 GET  /api/v1/jobs/{id}/result    -> the finished file, once status is "completed"
                                     (409 otherwise) -- Content-Type and filename
                                     extension match whichever capability ran.
+```
+
+Analyze example (a genuinely mixed PDF -- one digital page, one scanned):
+```powershell
+curl.exe -F "file=@transcript.pdf" http://127.0.0.1:8000/api/v1/analyze
+```
+```json
+{
+  "doc_type": "pdf", "page_count": 2, "classification": "mixed",
+  "pages": [
+    {"index": 0, "has_text_layer": true, "width_pt": 300.0, "height_pt": 200.0},
+    {"index": 1, "has_text_layer": false, "width_pt": 300.0, "height_pt": 200.0}
+  ],
+  "metadata": {"producer": null, "creator": null, "creation_date": null, "encrypted": false},
+  "quality_flags": []
+}
 ```
 
 Synchronous example (defaults to the OCR->Excel capability):

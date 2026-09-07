@@ -53,6 +53,13 @@ who converted what kind of file to what target and whether it succeeded
 -- separate from the ad-hoc print() logging already used for request
 diagnostics throughout this file.
 
+Phase 4 completion (master directive numbering) added POST
+/api/v1/analyze: inspects an uploaded file (document_analysis.py) and
+reports page-level digital/scanned/mixed classification, safe metadata,
+and quality flags -- without running any conversion. Independent of the
+`/convert` and `/jobs` paths above; a caller can inspect a file before
+committing to a full (and, for OCR targets, slower) conversion job.
+
 Run locally:
     uvicorn documents_converter.api.app:app --reload
 """
@@ -79,6 +86,7 @@ from .jobs import Job, JobStore
 from .rate_limit import FixedWindowRateLimiter
 from .storage import storage
 from .. import converters  # noqa: F401 -- import for its registration side effect only
+from ..document_analysis import analyze
 from ..ocr_excel import check_tesseract_available
 from ..registry import Capability, registry
 
@@ -316,6 +324,88 @@ def _check_decompression_bomb(input_path: Path, ext: str) -> None:
     else:
         with PILImage.open(input_path) as img:
             security.check_image_dimensions(*img.size)
+
+
+@app.post("/api/v1/analyze", dependencies=[Depends(require_api_key)])
+def analyze_document(request: Request, file: UploadFile) -> dict:
+    """
+    Inspects an uploaded PDF or image and reports its page-level
+    digital/scanned/mixed classification, safe metadata, and quality
+    flags (documents_converter/document_analysis.py) -- without running
+    any conversion. Lets a caller decide what to do with a file, or show
+    a preview of what a conversion would be working with, before
+    committing to the (for OCR targets, much slower) /convert or /jobs
+    endpoints. Gated by the same auth/rate-limit policy as those, since
+    it still processes a real uploaded file.
+    """
+    _check_rate_limit(request)
+
+    work_dir = storage.allocate("docconv-analyze-")
+    try:
+        input_path, ext = _validate_and_save_upload(request, file, work_dir)
+        if ext not in security.MAGIC_SIGNATURES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot analyze '{ext}' -- not a recognized PDF/image extension.",
+            )
+
+        request_id = uuid.uuid4().hex[:12]
+        size_bytes = input_path.stat().st_size
+        audit.log_event(
+            "analyze_requested",
+            request_id=request_id,
+            ext=ext,
+            size_bytes=size_bytes,
+            client_ip=_client_ip(request),
+            auth_enforced=bool(config.API_KEYS),
+        )
+
+        try:
+            _check_decompression_bomb(input_path, ext)
+            result = analyze(input_path, ext)
+        except security.FileTooLargeError as e:
+            audit.log_event("analyze_failed", request_id=request_id, reason="file_too_large")
+            raise HTTPException(status_code=413, detail=str(e)) from e
+        except Exception as e:
+            # Per docs/PHASE_0_AUDIT.md failure philosophy: never expose a
+            # raw stack trace to the caller.
+            print(f"[{request_id}] analysis failed: {e!r}")
+            audit.log_event("analyze_failed", request_id=request_id, reason="internal_error")
+            raise HTTPException(
+                status_code=500,
+                detail="Analysis failed. This has been logged for investigation.",
+            ) from e
+
+        # Safe, derived fields only (category names, counts) -- never the
+        # metadata dict itself, which is returned to the caller below but
+        # deliberately kept out of server-side logs (see
+        # document_analysis.DocumentAnalysis's own docstring).
+        audit.log_event(
+            "analyze_completed",
+            request_id=request_id,
+            doc_type=result.doc_type,
+            classification=result.classification,
+            page_count=result.page_count,
+            quality_flags=result.quality_flags,
+        )
+        return {
+            "doc_type": result.doc_type,
+            "page_count": result.page_count,
+            "classification": result.classification,
+            "pages": [
+                {
+                    "index": p.index,
+                    "has_text_layer": p.has_text_layer,
+                    "width_pt": p.width_pt,
+                    "height_pt": p.height_pt,
+                }
+                for p in result.pages
+            ],
+            "metadata": result.metadata,
+            "quality_flags": result.quality_flags,
+        }
+    finally:
+        storage.release(work_dir)
 
 
 @app.post("/api/v1/convert", dependencies=[Depends(require_api_key)])
