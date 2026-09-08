@@ -24,6 +24,28 @@ MAGIC_SIGNATURES: dict[str, tuple[bytes, ...]] = {
     ".bmp": (b"BM",),
     # .webp is deliberately NOT here -- see matches_magic_bytes below, it
     # needs a non-prefix check this dict's shape can't express.
+
+    # Phase 9 (master directive numbering): the OOXML Office formats
+    # (.docx/.xlsx/.pptx) are all plain ZIP containers -- this signature
+    # can only confirm "this is a zip file", not which of the three it
+    # actually is (that would need parsing the zip's internal
+    # [Content_Types].xml). Real, disclosed limitation, not an oversight:
+    # still catches the actual attack this check exists for (a renamed
+    # .txt/.exe claiming to be a .docx), just not a .docx renamed to .xlsx.
+    ".docx": (b"PK\x03\x04",),
+    ".xlsx": (b"PK\x03\x04",),
+    ".pptx": (b"PK\x03\x04",),
+    # Legacy binary Office formats (OLE/CFB container) -- same disclosed
+    # limitation: one shared signature can't distinguish .doc from .xls
+    # from .ppt, only "this is some CFB-container file".
+    ".doc": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",),
+    ".xls": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",),
+    ".ppt": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",),
+    # .html/.htm/.md/.markdown are deliberately NOT here -- plain text
+    # formats have no reliable magic bytes at all (valid HTML can start
+    # with whitespace, a comment, a doctype in any case, etc.; Markdown
+    # is unstructured text by design). matches_magic_bytes's existing
+    # fallback (no registered signature => accept) applies to these.
 }
 
 # Longest signature above is 8 bytes; also enough headroom for the WEBP

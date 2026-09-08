@@ -34,6 +34,12 @@ documents_converter/
         searchable_pdf.py             scanned document -> searchable PDF (Phase 5
                                       completion): original page image + invisible
                                       OCR text layer
+        pdf_to_images.py              PDF -> one PNG per page, zipped (Phase 9)
+        pdf_to_text.py                PDF -> plain text, OCR for scanned pages
+        office_to_pdf.py              Word/Excel/PowerPoint -> PDF (LibreOffice)
+        html_to_pdf.py                HTML -> PDF (LibreOffice)
+        markdown_to_pdf.py            Markdown -> HTML -> PDF (LibreOffice)
+        _libreoffice.py               shared LibreOffice-headless conversion helper
     api/
         app.py                       minimal synchronous HTTP API (see below)
         config.py                    environment-based API configuration
@@ -58,10 +64,17 @@ tests/
     test_storage.py                    storage abstraction unit tests
     test_document_analysis.py          document analysis unit tests
     test_searchable_pdf.py             searchable-PDF conversion unit tests
+    test_pdf_conversions.py            PDF->images/text unit tests (Phase 9)
+    test_libreoffice_conversions.py    Office/HTML/Markdown->PDF tests (Phase 9,
+                                      @requires_libreoffice -- skips locally, runs
+                                      in Docker/CI)
     test_frontend.py                   real-browser (Playwright) frontend tests
     fixtures/synthetic_scan.py        generates a fabricated (no real data) test PDF
     fixtures/synthetic_invoice.py     fabricated invoice-style table, saved as WEBP
                                       (Phase 8 completion: WEBP + a different table layout)
+    fixtures/synthetic_office.py      fabricated .docx/.xlsx/.pptx/.html/.md fixtures
+                                      (Phase 9; python-docx/python-pptx are dev-only,
+                                      not part of the runtime conversion path)
 docs/
     PHASE_0_AUDIT.md                  current-state audit, capability matrix, phase plan
 .github/workflows/test.yml            CI: runs the test suite on every push/PR
@@ -196,19 +209,77 @@ without hardcoding another special case into the API layer (`if ext ==
 every conversion after the first). Both `/api/v1/convert` and
 `/api/v1/jobs` route through it via an optional `target` field.
 
-Three capabilities are registered today:
+Eight capabilities are registered today:
 
 | source format      | target            | accepts                                       | what it does                          |
 |---------------------|-------------------|--------------------------------------------------|----------------------------------------|
 | `scanned_document`   | `xlsx`            | `.pdf .png .jpg .jpeg .tiff .tif .bmp .webp` | the OCR + table-detection pipeline above |
 | `image`              | `pdf`             | `.png .jpg .jpeg .tiff .tif .bmp .webp`      | plain image → single-page PDF, no OCR  |
 | `scanned_document`   | `searchable_pdf`  | `.pdf .png .jpg .jpeg .tiff .tif .bmp .webp` | original page image + invisible OCR text layer (Phase 5 completion) |
+| `pdf_document`       | `images`          | `.pdf`                                        | PDF → one PNG per page, zipped (Phase 9 completion) |
+| `pdf_document`       | `text`            | `.pdf`                                        | PDF → plain text: native text layer where present, OCR where not |
+| `office_document`    | `pdf`             | `.docx .doc .xlsx .xls .pptx .ppt`            | Word/Excel/PowerPoint → PDF, via LibreOffice headless |
+| `html`               | `pdf`             | `.html .htm`                                  | HTML → PDF, via LibreOffice headless |
+| `markdown`           | `pdf`             | `.md .markdown`                               | Markdown → HTML (the `markdown` package) → PDF |
 
 WEBP support (Phase 8 completion, master directive numbering) needed its
 own magic-byte check (`documents_converter/api/security.py`): WEBP's
 container has a 4-byte file size between `RIFF` and `WEBP` that varies
 per file, so unlike every other format here it can't be one fixed
 prefix — verified against a real file, not assumed from the spec.
+
+### Core Conversion Engine (Phase 9 completion)
+
+The five conversions above (`pdf_document`/`office_document`/`html`/
+`markdown` → `images`/`text`/`pdf`) round out the master directive's
+Phase 9 list. PDF→images and PDF→text need no new dependency (PyMuPDF
+and, for scanned pages, the existing Tesseract pipeline already cover
+them). Word/Excel/PowerPoint/HTML → PDF all go through **LibreOffice
+headless** (`documents_converter/converters/_libreoffice.py`) — a
+deliberate, informed choice, not a default reach: there's no lightweight
+pure-Python option that renders real Office files correctly, so this
+project accepts a real document-rendering engine (a system binary, not a
+pip package) as the cost of that capability actually working. Markdown
+routes through the same LibreOffice HTML path (via the `markdown`
+package) rather than needing its own renderer.
+
+Two LibreOffice quirks handled explicitly, not left to surprise the
+first real user:
+- It only lets you pick an output *directory*, not an exact output
+  filename — each call runs against an isolated temp directory and the
+  result is moved to the expected path.
+- Multiple headless instances sharing the default user-profile directory
+  fail against each other (a well-documented LibreOffice limitation).
+  Since this service's job queue runs conversions concurrently
+  (`_convert_executor`, up to 4 at once), every call gets its own
+  throwaway profile directory — verified with a real test that runs 4
+  LibreOffice conversions concurrently and checks all 4 succeed.
+
+**Local dev note:** LibreOffice is not installed on this project's own
+Windows dev machine — a deliberate choice, not an oversight (see the
+Phase 9 commit message). `tests/test_libreoffice_conversions.py` and the
+Office/HTML/Markdown tests in `tests/test_api.py` skip locally
+(`@requires_libreoffice`) and run for real in Docker and CI, where it's
+installed via `apt`.
+
+**Known gap, disclosed rather than assumed away:** Office documents
+(`.docx`/`.xlsx`/`.pptx`) are ZIP containers and can, like any ZIP-based
+format, be zip-bombed — this project's decompression-bomb check
+(`documents_converter/api/app.py::_check_decompression_bomb`) doesn't
+cover them yet. Today's only protection is the raw upload size limit
+(`MAX_UPLOAD_MB`) and the overall conversion timeout. Dedicated
+malicious-file testing for these formats is master directive Phase 19's
+job (Performance & Security Hardening), not this one's.
+
+**Performance characteristic, measured not assumed:** each LibreOffice
+conversion took roughly 6 seconds in real testing (4 concurrent HTML→PDF
+jobs through a real running container, ~6.2–6.5s each) — headless
+LibreOffice starts a fresh process per call rather than running as a
+persistent daemon, so that per-call startup cost is paid every time.
+Fine for the job-queue pattern this service already uses; a
+higher-throughput deployment would want a persistent LibreOffice
+listener (`--accept=socket,...`) instead, not built here since nothing
+about this project's current scale needs it yet.
 
 `GET /api/v1/capabilities` reports this list live, from the registry
 itself, so it can't drift out of sync with what the server actually does:
@@ -408,6 +479,15 @@ document, now selectable/searchable/copyable text instead of a table):
 curl.exe -F "target=searchable_pdf" -F "file=@transcript.pdf" http://127.0.0.1:8000/api/v1/convert -o result.pdf
 ```
 
+Synchronous examples, Phase 9 completion (Core Conversion Engine):
+```powershell
+curl.exe -F "target=images" -F "file=@transcript.pdf" http://127.0.0.1:8000/api/v1/convert -o pages.zip
+curl.exe -F "target=text" -F "file=@transcript.pdf" http://127.0.0.1:8000/api/v1/convert -o transcript.txt
+curl.exe -F "target=pdf" -F "file=@report.docx" http://127.0.0.1:8000/api/v1/convert -o report.pdf
+curl.exe -F "target=pdf" -F "file=@page.html" http://127.0.0.1:8000/api/v1/convert -o page.pdf
+curl.exe -F "target=pdf" -F "file=@notes.md" http://127.0.0.1:8000/api/v1/convert -o notes.pdf
+```
+
 Async example:
 ```powershell
 curl.exe -F "file=@transcript.pdf" http://127.0.0.1:8000/api/v1/jobs
@@ -534,13 +614,15 @@ docker build -t documents-converter-api .
 docker run -p 8000:8000 documents-converter-api
 ```
 
-Tesseract is installed inside the image (`apt-get install tesseract-ocr`),
-so no `TESSERACT_CMD` is needed there. Verified locally: built the image,
-ran it, and confirmed a real conversion through the container produces the
-same correct data as running natively — worth knowing if you compare
-outputs closely, the *blank*-cell noise can differ slightly page to page,
-since the Linux `apt` Tesseract build reads faint empty-cell artifacts a
-little differently than the Windows build used elsewhere in this project;
+Tesseract and LibreOffice (Phase 9 completion — `libreoffice-writer`/
+`-calc`/`-impress`, not the full suite) are both installed inside the
+image, so no `TESSERACT_CMD`/`LIBREOFFICE_CMD` is needed there. Verified
+locally: built the image, ran it, and confirmed a real conversion
+through the container produces the same correct data as running
+natively — worth knowing if you compare outputs closely, the
+*blank*-cell noise can differ slightly page to page, since the Linux
+`apt` Tesseract build reads faint empty-cell artifacts a little
+differently than the Windows build used elsewhere in this project;
 that's cosmetic, not a correctness issue (see the Accuracy & trust report
 below on this class of noise generally).
 

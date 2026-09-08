@@ -21,14 +21,20 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install system dependencies (Tesseract OCR)
+      - name: Install system dependencies (Tesseract OCR, LibreOffice)
         # opencv-contrib-python needs libGL/libglib even headless on a
         # minimal Linux image -- a common gotcha on CI runners, not
-        # optional here.
+        # optional here. libreoffice-writer/-calc/-impress (Phase 9,
+        # master directive numbering) are what tests/
+        # test_libreoffice_conversions.py and the Office/HTML/Markdown
+        # tests in test_api.py need to actually run here instead of
+        # perpetually skipping -- same targeted-packages choice as the
+        # Dockerfile, not the full libreoffice metapackage.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            tesseract-ocr libgl1 libglib2.0-0
+            tesseract-ocr libgl1 libglib2.0-0 \
+            libreoffice-writer libreoffice-calc libreoffice-impress
 
       - name: Install Python dependencies
         run: |

@@ -32,7 +32,7 @@ from PIL import Image
 from documents_converter.api import config, security
 from documents_converter.api.app import _rate_limiter, app
 
-from conftest import requires_tesseract
+from conftest import requires_libreoffice, requires_tesseract
 
 client = TestClient(app)
 
@@ -835,3 +835,109 @@ def test_convert_rejects_a_file_claiming_to_be_webp_but_is_not():
     )
     assert resp.status_code == 400
     assert "doesn't match its extension" in resp.json()["detail"]
+
+
+# --------------------------------------------------------------------------
+# Phase 9 (master directive numbering): Core Conversion Engine, through
+# the real HTTP API. PDF->images/text need no new system dependency and
+# run locally; Office/HTML/Markdown->PDF need LibreOffice, gated with
+# @requires_libreoffice (skips here, runs in Docker/CI -- see that
+# fixture's own note in conftest.py).
+# --------------------------------------------------------------------------
+
+
+def test_capabilities_endpoint_lists_all_phase_9_conversions():
+    pairs = {
+        (c["source_format"], c["target_format"]) for c in client.get("/api/v1/capabilities").json()
+    }
+    assert ("pdf_document", "images") in pairs
+    assert ("pdf_document", "text") in pairs
+    assert ("office_document", "pdf") in pairs
+    assert ("html", "pdf") in pairs
+    assert ("markdown", "pdf") in pairs
+
+
+def _tiny_pdf_bytes() -> bytes:
+    doc = fitz.open()
+    page = doc.new_page(width=200, height=150)
+    page.insert_text((20, 75), "API test page.")
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+def test_convert_pdf_to_images_end_to_end():
+    resp = client.post(
+        "/api/v1/convert",
+        data={"target": "images"},
+        files={"file": ("doc.pdf", io.BytesIO(_tiny_pdf_bytes()), "application/pdf")},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        assert zf.namelist() == ["page-001.png"]
+
+
+def test_convert_pdf_to_text_end_to_end():
+    resp = client.post(
+        "/api/v1/convert",
+        data={"target": "text"},
+        files={"file": ("doc.pdf", io.BytesIO(_tiny_pdf_bytes()), "application/pdf")},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/plain")
+    assert "API test page." in resp.text
+
+
+@requires_libreoffice
+def test_convert_docx_to_pdf_end_to_end(libreoffice_cmd, monkeypatch, tmp_path):
+    from synthetic_office import MARKER_TEXT, build_docx
+
+    monkeypatch.setattr(config, "LIBREOFFICE_CMD", libreoffice_cmd)
+    docx_path = tmp_path / "doc.docx"
+    build_docx(docx_path)
+
+    with open(docx_path, "rb") as f:
+        resp = client.post(
+            "/api/v1/convert",
+            data={"target": "pdf"},
+            files={
+                "file": (
+                    "doc.docx",
+                    f,
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            },
+        )
+    assert resp.status_code == 200
+    doc = fitz.open(stream=resp.content, filetype="pdf")
+    try:
+        text = "\n".join(page.get_text() for page in doc)
+    finally:
+        doc.close()
+    assert MARKER_TEXT in text
+
+
+@requires_libreoffice
+def test_job_html_to_pdf_end_to_end(libreoffice_cmd, monkeypatch, tmp_path):
+    from synthetic_office import MARKER_TEXT, build_html
+
+    monkeypatch.setattr(config, "LIBREOFFICE_CMD", libreoffice_cmd)
+    html_path = tmp_path / "page.html"
+    build_html(html_path)
+
+    with open(html_path, "rb") as f:
+        resp = client.post(
+            "/api/v1/jobs", data={"target": "pdf"}, files={"file": ("page.html", f, "text/html")}
+        )
+    assert resp.status_code == 202
+    job_id = resp.json()["job_id"]
+    assert _wait_for_job_terminal(job_id) == "completed"
+
+    result_resp = client.get(f"/api/v1/jobs/{job_id}/result")
+    doc = fitz.open(stream=result_resp.content, filetype="pdf")
+    try:
+        text = "\n".join(page.get_text() for page in doc)
+    finally:
+        doc.close()
+    assert MARKER_TEXT in text

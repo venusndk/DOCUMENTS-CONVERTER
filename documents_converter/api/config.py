@@ -15,6 +15,12 @@ import os
 # PATH (mirrors the CLI's --tesseract-cmd). Unset by default.
 TESSERACT_CMD: str | None = os.environ.get("TESSERACT_CMD") or None
 
+# Full path to the LibreOffice (soffice) executable, only needed if it's
+# not already on PATH -- same convention as TESSERACT_CMD above. Used by
+# the Office/HTML/Markdown -> PDF capabilities (master directive Phase 9,
+# documents_converter/converters/_libreoffice.py). Unset by default.
+LIBREOFFICE_CMD: str | None = os.environ.get("LIBREOFFICE_CMD") or None
+
 # Reject uploads above this size before doing any processing work.
 MAX_UPLOAD_MB: int = int(os.environ.get("MAX_UPLOAD_MB", "50"))
 

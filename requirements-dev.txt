@@ -9,3 +9,8 @@ requests==2.34.2    # tests/test_frontend.py's live-server health check
 playwright==1.59.0  # tests/test_frontend.py -- real browser tests for the
                     # frontend. Also needs a one-time browser install:
                     #   playwright install chromium --with-deps
+python-docx==1.2.0  # tests/fixtures/synthetic_office.py -- builds real
+python-pptx==1.0.2  # .docx/.pptx test fixtures (Phase 9, master directive
+                    # numbering). Test-only: LibreOffice does the actual
+                    # runtime conversion, these just generate fixtures to
+                    # convert. openpyxl (requirements.txt) covers .xlsx.
