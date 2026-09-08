@@ -18,7 +18,9 @@ from . import (
     markdown_to_pdf,
     ocr_to_excel,
     office_to_pdf,
+    pdf_to_docx,
     pdf_to_images,
+    pdf_to_pptx,
     pdf_to_text,
     searchable_pdf,
 )
@@ -31,3 +33,5 @@ registry.register(pdf_to_text.CAPABILITY)
 registry.register(office_to_pdf.CAPABILITY)
 registry.register(html_to_pdf.CAPABILITY)
 registry.register(markdown_to_pdf.CAPABILITY)
+registry.register(pdf_to_docx.CAPABILITY)
+registry.register(pdf_to_pptx.CAPABILITY)
