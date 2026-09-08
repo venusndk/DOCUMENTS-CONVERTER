@@ -48,7 +48,9 @@ CAPABILITY = Capability(
     source_format="scanned_document",
     target_format="xlsx",
     description="Scanned PDF or photographed table image -> Excel, via OCR and table detection.",
-    source_extensions=frozenset({".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}),
+    source_extensions=frozenset(
+        {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}
+    ),
     output_extension=".xlsx",
     media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     convert=_convert,

@@ -22,9 +22,12 @@ MAGIC_SIGNATURES: dict[str, tuple[bytes, ...]] = {
     ".tif": (b"II*\x00", b"MM\x00*"),
     ".tiff": (b"II*\x00", b"MM\x00*"),
     ".bmp": (b"BM",),
+    # .webp is deliberately NOT here -- see matches_magic_bytes below, it
+    # needs a non-prefix check this dict's shape can't express.
 }
 
-# Longest signature above is 8 bytes; read a little extra headroom.
+# Longest signature above is 8 bytes; also enough headroom for the WEBP
+# check below (needs bytes 0-11).
 MAGIC_BYTES_TO_READ = 16
 
 MAX_IMAGE_MEGAPIXELS = 50
@@ -41,6 +44,14 @@ def matches_magic_bytes(ext: str, header: bytes) -> bool:
         documents_converter/registry.py -- before acting on the file
         this validates)
     """
+    if ext == ".webp":
+        # WEBP's container (RIFF) has a 4-byte little-endian file size
+        # between "RIFF" and "WEBP" that varies per file, so -- unlike
+        # every other format here -- it can't be one fixed byte-string
+        # prefix in MAGIC_SIGNATURES. Verified against a real file:
+        # Pillow's own WEBP writer produces exactly b"RIFF" + 4 size
+        # bytes + b"WEBP" (Phase 8 completion, master directive numbering).
+        return header[:4] == b"RIFF" and header[8:12] == b"WEBP"
     sigs = MAGIC_SIGNATURES.get(ext)
     if not sigs:
         return True

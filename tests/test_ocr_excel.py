@@ -196,6 +196,36 @@ def test_review_json_matches_the_written_xlsx(tmp_path, synthetic_pdf, tesseract
             assert cell["value"] == xlsx_value
 
 
+@requires_tesseract
+def test_convert_scanned_to_excel_handles_webp_and_a_new_table_layout(
+    tmp_path, synthetic_invoice_webp, tesseract_cmd
+):
+    """
+    Phase 8 completion (master directive numbering): two things
+    docs/PHASE_0_AUDIT.md flagged as unverified, checked together --
+    WEBP as an input format, and a genuinely different table layout
+    (invoice-style item/qty/price/total) than the transcript-style
+    grade sheet every other end-to-end test in this project uses.
+    Locks in exact expected values, not just "did it not crash".
+    """
+    out_path = tmp_path / "invoice.xlsx"
+    ste.convert_scanned_to_excel(
+        file_path=str(synthetic_invoice_webp),
+        output_excel_path=str(out_path),
+        tesseract_cmd=tesseract_cmd,
+    )
+
+    assert out_path.exists()
+    wb = openpyxl.load_workbook(str(out_path))
+    ws = wb[wb.sheetnames[0]]
+    rows = [row for row in ws.iter_rows(values_only=True)]
+
+    assert rows[0][:4] == ("Item", "Qty", "Unit Price", "Total")
+    assert rows[1][:4] == ("Widget A", "3", "10.00", "30.00")
+    assert rows[2][:4] == ("Widget B", "2", "25.00", "50.00")
+    assert rows[3][:4] == ("Gadget C", "1", "99.99", "99.99")
+
+
 # --------------------------------------------------------------------------
 # Phase 2: provider-level tests (docs/PHASE_0_AUDIT.md). Added when the
 # per-cell OCR call and the table-detection strategy were pulled out behind

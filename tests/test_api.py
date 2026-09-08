@@ -788,3 +788,50 @@ def test_review_endpoints_404_for_unknown_job():
         ).status_code
         == 404
     )
+
+
+# --------------------------------------------------------------------------
+# Phase 8 completion: WEBP support, through the real HTTP API (not just
+# the ocr_excel module directly -- see tests/test_ocr_excel.py for the
+# full-pipeline/table-layout verification).
+# --------------------------------------------------------------------------
+
+
+def _sample_webp_bytes() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (300, 300), color=(40, 90, 160)).save(buf, "WEBP")
+    return buf.getvalue()
+
+
+def test_capabilities_endpoint_lists_webp_for_every_image_capability():
+    resp = client.get("/api/v1/capabilities")
+    for cap in resp.json():
+        if cap["source_format"] in ("scanned_document", "image"):
+            assert ".webp" in cap["accepted_extensions"]
+
+
+def test_convert_image_to_pdf_accepts_a_real_webp_file():
+    resp = client.post(
+        "/api/v1/convert",
+        data={"target": "pdf"},
+        files={"file": ("photo.webp", io.BytesIO(_sample_webp_bytes()), "image/webp")},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/pdf"
+
+    doc = fitz.open(stream=resp.content, filetype="pdf")
+    try:
+        assert doc.page_count == 1
+        assert doc[0].rect.width == 300 and doc[0].rect.height == 300
+    finally:
+        doc.close()
+
+
+def test_convert_rejects_a_file_claiming_to_be_webp_but_is_not():
+    resp = client.post(
+        "/api/v1/convert",
+        data={"target": "pdf"},
+        files={"file": ("fake.webp", io.BytesIO(b"not actually a webp file"), "image/webp")},
+    )
+    assert resp.status_code == 400
+    assert "doesn't match its extension" in resp.json()["detail"]

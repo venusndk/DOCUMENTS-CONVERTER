@@ -36,8 +36,8 @@ def _convert(input_path: Path, output_path: Path, *, progress: Callable[[str], N
 CAPABILITY = Capability(
     source_format="image",
     target_format="pdf",
-    description="Image (PNG/JPEG/TIFF/BMP) -> single-page PDF. No OCR: a plain image-to-container conversion.",
-    source_extensions=frozenset({".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}),
+    description="Image (PNG/JPEG/TIFF/BMP/WEBP) -> single-page PDF. No OCR: a plain image-to-container conversion.",
+    source_extensions=frozenset({".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}),
     output_extension=".pdf",
     media_type="application/pdf",
     convert=_convert,
