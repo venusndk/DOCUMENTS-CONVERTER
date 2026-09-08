@@ -106,3 +106,9 @@ def test_the_real_registry_has_the_registered_capabilities():
     assert ("scanned_document", "xlsx") in pairs
     assert ("image", "pdf") in pairs
     assert ("scanned_document", "searchable_pdf") in pairs
+    # Phase 9 (master directive numbering): Core Conversion Engine.
+    assert ("pdf_document", "images") in pairs
+    assert ("pdf_document", "text") in pairs
+    assert ("office_document", "pdf") in pairs
+    assert ("html", "pdf") in pairs
+    assert ("markdown", "pdf") in pairs

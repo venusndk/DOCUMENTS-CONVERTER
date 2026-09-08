@@ -5,10 +5,21 @@ FROM python:3.12-slim
 
 # opencv-contrib-python needs libGL/libglib even headless on a minimal
 # Linux image -- a common gotcha, not optional here.
+#
+# Phase 9 (master directive numbering): libreoffice-writer/-calc/-impress
+# cover Word/Excel/PowerPoint/HTML -> PDF (documents_converter/converters/
+# office_to_pdf.py, html_to_pdf.py, markdown_to_pdf.py, _libreoffice.py).
+# Deliberately the three targeted packages, not the `libreoffice` metapackage
+# (which pulls in the full suite -- Draw, Base, Math, wizards, extra
+# language packs -- none of which this project's headless --convert-to
+# pdf usage touches) to keep the image smaller.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tesseract-ocr \
         libgl1 \
         libglib2.0-0 \
+        libreoffice-writer \
+        libreoffice-calc \
+        libreoffice-impress \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

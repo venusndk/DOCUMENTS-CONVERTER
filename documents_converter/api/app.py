@@ -315,16 +315,36 @@ def _validate_and_save_upload(request: Request, file: UploadFile, work_dir: Path
     return input_path, ext
 
 
+_IMAGE_BOMB_CHECK_EXTENSIONS = frozenset(
+    {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}
+)
+
+
 def _check_decompression_bomb(input_path: Path, ext: str) -> None:
     """Checks the parsed/decompressed size (PDF page count, image pixel
-    dimensions) before the expensive OCR pipeline runs. Raises
-    security.FileTooLargeError if it's over the configured limit."""
+    dimensions) before the expensive OCR/conversion pipeline runs. Raises
+    security.FileTooLargeError if it's over the configured limit.
+
+    Phase 9 (master directive numbering) added Office documents (.docx/
+    .xlsx/.pptx and their legacy binary equivalents), HTML, and Markdown
+    as acceptable inputs -- none of them get a decompression check here.
+    HTML/Markdown are plain text with nothing to decompress. Office
+    documents (ZIP containers, like every OOXML format) genuinely CAN be
+    zip-bombed, same class of risk as any ZIP-based format -- not
+    covered by a check here yet. Real, disclosed gap, not silently
+    assumed safe: the raw upload size limit (config.MAX_UPLOAD_MB) and
+    the overall conversion timeout (config.CONVERT_TIMEOUT_SECONDS,
+    which every capability's call already runs under) are the only
+    protection today. Dedicated malicious-file/zip-bomb testing for
+    these formats is master directive Phase 19's job (Performance &
+    Security Hardening), not this one's.
+    """
     if ext == ".pdf":
         doc = fitz.open(str(input_path))
         n_pages = len(doc)
         doc.close()
         security.check_pdf_page_count(n_pages)
-    else:
+    elif ext in _IMAGE_BOMB_CHECK_EXTENSIONS:
         with PILImage.open(input_path) as img:
             security.check_image_dimensions(*img.size)
 
@@ -346,7 +366,12 @@ def analyze_document(request: Request, file: UploadFile) -> dict:
     work_dir = storage.allocate("docconv-analyze-")
     try:
         input_path, ext = _validate_and_save_upload(request, file, work_dir)
-        if ext not in security.MAGIC_SIGNATURES:
+        # document_analysis.analyze() only actually knows how to handle
+        # PDF and traditional images -- checked against that directly,
+        # not security.MAGIC_SIGNATURES (which is broader as of Phase 9's
+        # new Office/HTML/Markdown capabilities; analysis hasn't been
+        # extended to those formats and shouldn't silently pretend to).
+        if ext != ".pdf" and ext not in _IMAGE_BOMB_CHECK_EXTENSIONS:
             raise HTTPException(
                 status_code=400,
                 detail=f"Cannot analyze '{ext}' -- not a recognized PDF/image extension.",

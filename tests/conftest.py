@@ -54,6 +54,39 @@ def tesseract_cmd() -> str:
     return TESSERACT_CMD
 
 
+def _find_libreoffice() -> str | None:
+    found = shutil.which("soffice")
+    if found:
+        return found
+    # Common Windows install locations -- not installed on this project's
+    # own dev machine as of Phase 9 (master directive numbering); real
+    # verification for the Office/HTML/Markdown -> PDF capabilities that
+    # need it happens in Docker (where it's apt-installed) and CI, not
+    # locally. Listed anyway so a Windows dev machine that does have it
+    # installed picks it up automatically.
+    for candidate in (
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    ):
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+LIBREOFFICE_CMD = _find_libreoffice()
+
+requires_libreoffice = pytest.mark.skipif(
+    LIBREOFFICE_CMD is None,
+    reason="LibreOffice (soffice) not found on PATH or at a default install path",
+)
+
+
+@pytest.fixture(scope="session")
+def libreoffice_cmd() -> str:
+    assert LIBREOFFICE_CMD is not None
+    return LIBREOFFICE_CMD
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _migrated_test_database():
     """

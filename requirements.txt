@@ -17,3 +17,9 @@ numpy==2.3.5
 opencv-contrib-python==5.0.0.93
 pypdfium2==5.13.0
 beautifulsoup4==4.9.3
+
+# Phase 9 (master directive numbering): Markdown -> HTML, the first step
+# of documents_converter/converters/markdown_to_pdf.py (LibreOffice
+# handles the HTML -> PDF half -- see that module and _libreoffice.py).
+# Pure Python, no system dependencies of its own.
+markdown==3.10.3
