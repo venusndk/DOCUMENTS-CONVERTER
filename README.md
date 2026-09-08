@@ -359,6 +359,77 @@ for the same capability becomes a real need (a cloud OCR fallback
 alongside Tesseract, say), that's the point to introduce the
 provider/capability split for real, not before.
 
+### PDF Utilities (Phase 11 completion, master directive numbering)
+
+*This is the master directive's Phase 11 ("PDF Utilities"). It is not
+the same Phase 11 as this project's own, earlier production-readiness
+hardening (LICENSE, non-root Docker user, audit trail, production auth
+guard — see Security hardening below) — two different things share the
+number because this project's own phase numbering predates switching to
+the master directive's numbering.*
+
+Eleven small, independent PDF operations, all pure PyMuPDF (no new
+dependency, unlike Phases 9–10's LibreOffice work):
+`documents_converter/pdf_utilities.py`. Exposed as their own family of
+endpoints rather than through the capability registry/`/convert`
+pipeline used everywhere else — a deliberate architectural choice, not
+an oversight: the registry's model is one source format → one target
+format via a single `target` string, and these operations don't fit
+that shape (merge needs *multiple* input files; the rest need an
+operation-specific parameter — a rotation angle, a page range, watermark
+text — that a single `target` field has no room for). All 11 are
+synchronous (no job-queue variant): every operation here is a fast,
+local, in-process PyMuPDF manipulation with nothing to gain from Phase
+7's async machinery, which exists for genuinely slow OCR/LibreOffice
+work.
+
+| Endpoint | Parameters | Returns |
+|---|---|---|
+| `POST /api/v1/pdf/merge` | `files` (2+ PDF uploads) | merged PDF, in upload order |
+| `POST /api/v1/pdf/split` | `file`; optional `ranges` (e.g. `1-2;3-4`) | ZIP of PDFs — one page per file if `ranges` omitted |
+| `POST /api/v1/pdf/extract` | `file`, `pages` (e.g. `3,1`) | PDF with just those pages, in the order given |
+| `POST /api/v1/pdf/reorder` | `file`, `order` (must be a full permutation) | PDF with pages in that order |
+| `POST /api/v1/pdf/delete-pages` | `file`, `pages` | PDF with those pages removed |
+| `POST /api/v1/pdf/rotate` | `file`, `degrees` (multiple of 90), optional `pages` | PDF rotated (every page if `pages` omitted) |
+| `POST /api/v1/pdf/watermark` | `file`, `text` | PDF with `text` stamped diagonally across every page |
+| `POST /api/v1/pdf/add-page-numbers` | `file`, optional `start` (default 1) | PDF with a page number stamped bottom-center |
+| `POST /api/v1/pdf/crop` | `file`, `left`/`top`/`right`/`bottom` (points) | PDF with each page's crop box shrunk inward |
+| `POST /api/v1/pdf/compress` | `file` | PDF re-saved with structural cleanup + stream compression |
+| `POST /api/v1/pdf/repair` | `file` | PDF re-saved through PyMuPDF's own (repairing) parser |
+
+All require the API key like every other endpoint (`X-API-Key`, when
+`API_KEYS` is configured — see Authentication below), reject non-`.pdf`
+uploads before doing any real work, and log a `pdf_utility_requested`
+audit event per call — same content-free logging discipline as the rest
+of the service (operation name and outcome only, never the document
+itself). `page` numbers in every parameter are 1-indexed for callers
+(`pdf_utilities.parse_page_spec` converts to 0-indexed internally); a
+page number out of range, a malformed spec, a non-permutation `order`,
+a non-multiple-of-90 rotation, or crop margins that would consume the
+whole page all return `400` rather than a stack trace or a silently
+wrong result.
+
+Three real bugs found and fixed in `add_watermark` during development,
+each confirmed by rendering the actual output to an image and visually
+inspecting it, not just by asserting the watermark text appears
+somewhere in an extraction:
+- PyMuPDF's `insert_textbox`/`insert_text` only accept `rotate` in
+  multiples of 90 — the diagonal watermark needs an actual 45-degree
+  angle, done instead via the `morph` parameter (a rotation matrix
+  pivoting around a chosen point).
+- `insert_textbox`'s rect-based layout anchors a line of text near the
+  *top* of its box, not through its vertical center — after a 45-degree
+  rotation around the page center, that mismatch swings the text toward
+  a corner and off the physical page. Fixed by switching to `insert_text`
+  with an explicitly computed origin point, so the rotation pivot and
+  the text's own visual center coincide.
+- The auto-shrink-to-fit font size was first budgeted against the
+  page's corner-to-corner diagonal length, which still let long
+  watermark text on a non-square page get clipped at both ends — a
+  45-degree line from the center actually reaches the *shorter* of the
+  page's width/height first, not the far corner, so the correct budget
+  is `min(width, height) * sqrt(2)`, not the raw diagonal.
+
 ## Document analysis (Phase 4 completion)
 
 `documents_converter/document_analysis.py` inspects a PDF or image and
