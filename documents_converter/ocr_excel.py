@@ -227,6 +227,72 @@ def _fix_rotated_cells(
     return fixed_count
 
 
+def _fix_empty_cells(table, page_img, min_area: int = 400, cell_ocr: CellOCRProvider = None) -> int:
+    """
+    Re-OCRs cells img2table's own extraction returned no text for at all.
+
+    Root-caused on a real (fabricated) invoice-style fixture during Phase
+    8 completion (master directive numbering): a cell holding nothing but
+    a short value (e.g. a one-digit quantity) positioned near the cell's
+    border came back completely empty from img2table's own per-cell OCR
+    pass. Confirmed directly (crop the identical bounding box, re-OCR
+    with and without trimming a few pixels from each edge) that a couple
+    pixels of border/gridline bleed were the entire cause -- the exact
+    same class of bug already fixed once in this project for rotated
+    header cells (see _fix_rotated_cells's own note on this), just never
+    hit before because every other tested document's short cell values
+    happened to sit further from their cell's border. img2table's own
+    internal cropping has no reason to know this project needs that
+    margin, so it doesn't apply one.
+
+    Deliberately only touches cells that came back completely empty,
+    never a short-but-present value (e.g. "M" for Sex, "1" for a
+    correctly-read row number) -- re-OCRing an already-successful read
+    risks turning a correct short answer into an incorrect one for no
+    confirmed gain, when the actual, confirmed failure mode here is
+    total OCR silence, not a wrong short answer.
+
+    Mutates `table.content` cell values in place. Returns the number of
+    cells successfully filled in (non-empty new value).
+    :param min_area: skip implausibly tiny bounding boxes (a handful of
+        stray pixels img2table itself probably shouldn't have called a
+        cell) rather than spending an OCR call on essentially nothing.
+    """
+    if page_img is None:
+        return 0
+
+    cell_ocr = cell_ocr or _default_cell_ocr
+    gray_page = cv2.cvtColor(page_img, cv2.COLOR_RGB2GRAY)
+    img_h, img_w = gray_page.shape[:2]
+
+    fixed_count = 0
+    for cells in table.content.values():
+        for cell in cells:
+            if cell.value:
+                continue
+            box = cell.bbox
+            w, h = box.x2 - box.x1, box.y2 - box.y1
+            if w <= 0 or h <= 0 or w * h < min_area:
+                continue
+
+            # Same 3px inward margin as _fix_rotated_cells, same reason:
+            # trims border/gridline bleed a 1-3px bbox offset pulls into
+            # the crop, at the cost of a little real text these already-
+            # small cells can spare.
+            margin = 3
+            x1, y1 = max(box.x1 + margin, 0), max(box.y1 + margin, 0)
+            x2, y2 = min(box.x2 - margin, img_w), min(box.y2 - margin, img_h)
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            new_value = cell_ocr.recognize(gray_page[y1:y2, x1:x2])
+            if new_value:
+                cell.value = new_value
+                fixed_count += 1
+
+    return fixed_count
+
+
 def _consensus_correct_headers(
     extracted_tables, min_group_size: int = 3, min_agreement: float = 0.34
 ) -> int:
@@ -375,7 +441,7 @@ def _write_table_flagged(table, sheet, normal_fmt, flag_fmt) -> tuple[int, list[
     return flagged, rows
 
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}
 
 
 def is_scanned_pdf(file_path: str, text_char_threshold: int = 20) -> bool:
@@ -433,6 +499,7 @@ def convert_scanned_to_excel(
     auto_rotate: bool = False,
     preprocess: bool = False,
     fix_rotated_headers: bool = True,
+    fix_empty_cells: bool = True,
     use_grid_fallback: bool = True,
     consensus_fix_headers: bool = True,
     flag_suspicious_cells: bool = True,
@@ -538,6 +605,24 @@ def convert_scanned_to_excel(
                 total_fixed += _fix_rotated_cells(table, page_img, cell_ocr=_default_cell_ocr)
         if total_fixed:
             progress(f"Re-OCR'd {total_fixed} rotated-text cell(s) (e.g. sideways column headers).")
+
+    if fix_empty_cells:
+        # Applied to every page regardless of extraction path (including
+        # grid-fallback pages, unlike the rotated-header fix above) --
+        # safe to always attempt since this only ever touches cells that
+        # are already completely empty, so there's no risk of redoing
+        # (or breaking) an already-successful read.
+        total_filled = 0
+        for page, tables in extracted_tables.items():
+            page_img = page_to_image.get(page)
+            for table in tables:
+                total_filled += _fix_empty_cells(table, page_img, cell_ocr=_default_cell_ocr)
+        if total_filled:
+            progress(
+                f"Re-OCR'd {total_filled} cell(s) img2table's own OCR pass returned "
+                f"nothing for at all (usually a short value, e.g. a single-digit "
+                f"quantity, sitting close to its cell's border)."
+            )
 
     if consensus_fix_headers:
         # Module name/code headers repeat identically across every page of
@@ -652,6 +737,14 @@ def main():
              "in wide grade/mark sheets, which plain OCR reads as noise."
     )
     parser.add_argument(
+        "--no-empty-cell-fix", dest="fix_empty_cells", action="store_false",
+        help="Skip re-OCR'ing cells img2table's own OCR pass returned nothing for at all "
+             "(default: enabled). Phase 8 completion: a short value (e.g. a single-digit "
+             "quantity) sitting close to its cell's border can come back completely empty "
+             "from img2table's own crop; this re-crops with a small inward margin and "
+             "re-reads it."
+    )
+    parser.add_argument(
         "--no-grid-fallback", dest="use_grid_fallback", action="store_false",
         help="Disable the direct grid-line-detection fallback (default: enabled). "
              "img2table's own table detector can silently drop entire pages (return 0 "
@@ -693,6 +786,7 @@ def main():
             auto_rotate=args.auto_rotate,
             preprocess=args.preprocess,
             fix_rotated_headers=args.fix_rotated_headers,
+            fix_empty_cells=args.fix_empty_cells,
             use_grid_fallback=args.use_grid_fallback,
             consensus_fix_headers=args.consensus_fix_headers,
             flag_suspicious_cells=args.flag_suspicious_cells,

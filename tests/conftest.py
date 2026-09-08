@@ -88,3 +88,17 @@ def synthetic_pdf(tmp_path_factory) -> Path:
     pdf_path = out_dir / "synthetic_scan.pdf"
     build_synthetic_scan(str(pdf_path))
     return pdf_path
+
+
+@pytest.fixture(scope="session")
+def synthetic_invoice_webp(tmp_path_factory) -> Path:
+    """A small, fabricated invoice-style table, saved as WEBP -- Phase 8
+    completion (master directive numbering): WEBP support and a
+    genuinely different table layout than synthetic_pdf's transcript
+    style, both verified in one fixture."""
+    from synthetic_invoice import build_synthetic_invoice
+
+    out_dir = tmp_path_factory.mktemp("fixtures")
+    webp_path = out_dir / "synthetic_invoice.webp"
+    build_synthetic_invoice(str(webp_path))
+    return webp_path

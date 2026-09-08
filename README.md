@@ -60,6 +60,8 @@ tests/
     test_searchable_pdf.py             searchable-PDF conversion unit tests
     test_frontend.py                   real-browser (Playwright) frontend tests
     fixtures/synthetic_scan.py        generates a fabricated (no real data) test PDF
+    fixtures/synthetic_invoice.py     fabricated invoice-style table, saved as WEBP
+                                      (Phase 8 completion: WEBP + a different table layout)
 docs/
     PHASE_0_AUDIT.md                  current-state audit, capability matrix, phase plan
 .github/workflows/test.yml            CI: runs the test suite on every push/PR
@@ -196,11 +198,17 @@ every conversion after the first). Both `/api/v1/convert` and
 
 Three capabilities are registered today:
 
-| source format      | target            | accepts                                | what it does                          |
-|---------------------|-------------------|------------------------------------------|----------------------------------------|
-| `scanned_document`   | `xlsx`            | `.pdf .png .jpg .jpeg .tiff .tif .bmp` | the OCR + table-detection pipeline above |
-| `image`              | `pdf`             | `.png .jpg .jpeg .tiff .tif .bmp`      | plain image → single-page PDF, no OCR  |
-| `scanned_document`   | `searchable_pdf`  | `.pdf .png .jpg .jpeg .tiff .tif .bmp` | original page image + invisible OCR text layer (Phase 5 completion) |
+| source format      | target            | accepts                                       | what it does                          |
+|---------------------|-------------------|--------------------------------------------------|----------------------------------------|
+| `scanned_document`   | `xlsx`            | `.pdf .png .jpg .jpeg .tiff .tif .bmp .webp` | the OCR + table-detection pipeline above |
+| `image`              | `pdf`             | `.png .jpg .jpeg .tiff .tif .bmp .webp`      | plain image → single-page PDF, no OCR  |
+| `scanned_document`   | `searchable_pdf`  | `.pdf .png .jpg .jpeg .tiff .tif .bmp .webp` | original page image + invisible OCR text layer (Phase 5 completion) |
+
+WEBP support (Phase 8 completion, master directive numbering) needed its
+own magic-byte check (`documents_converter/api/security.py`): WEBP's
+container has a 4-byte file size between `RIFF` and `WEBP` that varies
+per file, so unlike every other format here it can't be one fixed
+prefix — verified against a real file, not assumed from the spec.
 
 `GET /api/v1/capabilities` reports this list live, from the registry
 itself, so it can't drift out of sync with what the server actually does:
@@ -642,6 +650,26 @@ an image and comparing it cell-by-cell against the extracted spreadsheet
   in the document (too few "peer" pages sharing the same column layout
   to vote with) don't benefit from cross-page correction and are more
   likely to still show OCR noise.
+
+### A new failure mode found and fixed (Phase 8 completion)
+
+Testing against a genuinely different table layout (a fabricated
+invoice-style item/quantity/price/total table, built specifically
+because every other test document in this project used the same
+transcript-style layout) found a real bug: a short value (e.g. a
+single-digit quantity) positioned close to its cell's border could come
+back **completely empty** from img2table's own per-cell OCR pass — not
+misread, silently missing. Root-caused directly (identical crop, re-OCR'd
+with and without trimming a few pixels from each edge) to the same class
+of bug already fixed once in this project for rotated header cells:
+border/gridline pixels bleeding into the OCR crop. Fixed the same way —
+`_fix_empty_cells` (`documents_converter/ocr_excel.py`) re-crops any
+cell that came back empty with a small inward margin and re-OCRs it,
+touching only cells that were already empty so an already-correct short
+read (like `"M"` for Sex) is never put at risk. `--no-empty-cell-fix` to
+disable. This is the value of testing against more than one document
+layout — the transcript fixture's short values never happened to sit
+close enough to a border to trigger this.
 
 ### The two safeguards built specifically for "trusted document" use
 

@@ -111,7 +111,9 @@ CAPABILITY = Capability(
         "selectable/searchable/copyable. No table extraction -- see the "
         "xlsx target for that."
     ),
-    source_extensions=frozenset({".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}),
+    source_extensions=frozenset(
+        {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}
+    ),
     output_extension=".pdf",
     media_type="application/pdf",
     convert=_convert,
