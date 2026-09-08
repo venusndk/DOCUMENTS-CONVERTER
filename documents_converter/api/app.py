@@ -60,6 +60,19 @@ and quality flags -- without running any conversion. Independent of the
 `/convert` and `/jobs` paths above; a caller can inspect a file before
 committing to a full (and, for OCR targets, slower) conversion job.
 
+Phase 11 (master directive numbering -- not this project's own,
+differently-numbered earlier Phase 11, production-readiness hardening;
+see README's disambiguation note) added POST /api/v1/pdf/*: eleven PDF
+manipulation operations (pdf_utilities.py) -- merge, split, extract,
+reorder, delete-pages, rotate, watermark, add-page-numbers, crop,
+compress, repair. Deliberately its own family of endpoints, not routed
+through the Capability registry/`target` field: merge needs multiple
+input files, and most of the others need an operation-specific
+parameter (a rotation angle, a page spec, watermark text) a single
+`target` string has no room for. Synchronous only, like /convert -- no
+job-queue variant, since every operation here is a fast, local,
+in-process PyMuPDF call with nothing for that machinery to buy.
+
 Run locally:
     uvicorn documents_converter.api.app:app --reload
 """
@@ -69,13 +82,15 @@ from __future__ import annotations
 import json
 import time
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Callable
 
 import openpyxl
-from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from openpyxl.styles import PatternFill
 from PIL import Image as PILImage
@@ -89,6 +104,7 @@ from .jobs import Job, JobStore
 from .rate_limit import FixedWindowRateLimiter
 from .storage import storage
 from .. import converters  # noqa: F401 -- import for its registration side effect only
+from .. import pdf_utilities
 from ..document_analysis import analyze
 from ..ocr_excel import _is_suspicious, check_tesseract_available
 from ..registry import Capability, registry
@@ -774,6 +790,400 @@ def submit_job_review(job_id: str, corrections: list[dict]) -> dict:
 
     audit.log_event("review_corrections_applied", job_id=job.id, count=applied)
     return {"applied": applied}
+
+
+# --------------------------------------------------------------------------
+# Phase 11 (master directive numbering): PDF Utilities.
+# --------------------------------------------------------------------------
+
+
+def _run_pdf_operation(operation: str, request_id: str, fn: Callable[[], object]) -> object:
+    """
+    Shared boilerplate every /api/v1/pdf/* endpoint needs around its
+    actual pdf_utilities.* call: audit logging and error mapping.
+    Returns whatever `fn` returns (split_pdf's written-file list, for
+    instance); raises HTTPException on failure. Callers still need
+    their own try/finally for storage cleanup around this, since that's
+    needed whether this succeeds or fails.
+    """
+    start_time = time.monotonic()
+    try:
+        result = fn()
+    except ValueError as e:
+        audit.log_event(
+            "pdf_utility_failed", request_id=request_id, operation=operation, reason="invalid_input"
+        )
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except security.FileTooLargeError as e:
+        audit.log_event(
+            "pdf_utility_failed", request_id=request_id, operation=operation, reason="file_too_large"
+        )
+        raise HTTPException(status_code=413, detail=str(e)) from e
+    except Exception as e:
+        print(f"[{request_id}] pdf utility '{operation}' failed: {e!r}")
+        audit.log_event(
+            "pdf_utility_failed", request_id=request_id, operation=operation, reason="internal_error"
+        )
+        raise HTTPException(
+            status_code=500, detail="Operation failed. This has been logged for investigation."
+        ) from e
+
+    audit.log_event(
+        "pdf_utility_completed",
+        request_id=request_id,
+        operation=operation,
+        duration_ms=int((time.monotonic() - start_time) * 1000),
+    )
+    return result
+
+
+def _pdf_response(path: Path, filename: str) -> Response:
+    return Response(
+        content=path.read_bytes(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+def _require_pdf_upload(request: Request, file: UploadFile, work_dir: Path) -> tuple[Path, str]:
+    """_validate_and_save_upload, plus the .pdf-only check every
+    /api/v1/pdf/* endpoint needs -- unlike /convert and /jobs, there's
+    no `target` to resolve a capability from here; every one of these
+    operations only ever accepts PDF input."""
+    input_path, ext = _validate_and_save_upload(request, file, work_dir)
+    if ext != ".pdf":
+        raise HTTPException(status_code=400, detail=f"Expected a .pdf file, got '{ext}'.")
+    return input_path, ext
+
+
+def _new_pdf_request_id(request: Request, operation: str, **fields) -> str:
+    request_id = uuid.uuid4().hex[:12]
+    audit.log_event(
+        "pdf_utility_requested",
+        request_id=request_id,
+        operation=operation,
+        client_ip=_client_ip(request),
+        auth_enforced=bool(config.API_KEYS),
+        **fields,
+    )
+    return request_id
+
+
+@app.post("/api/v1/pdf/merge", dependencies=[Depends(require_api_key)])
+def pdf_merge(request: Request, files: list[UploadFile] = File(...)) -> Response:
+    _check_rate_limit(request)
+    if len(files) < 2:
+        raise HTTPException(status_code=400, detail="Merge needs at least 2 files.")
+
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_paths = []
+        for i, f in enumerate(files):
+            # _validate_and_save_upload always writes to a fixed
+            # "input<ext>" name -- fine for every other endpoint here
+            # (one file each), but multiple files in the same work_dir
+            # would collide on that name, so each is renamed to its own
+            # slot immediately after saving, before the next file's
+            # save reuses "input.pdf".
+            input_path, ext = _validate_and_save_upload(request, f, work_dir)
+            if ext != ".pdf":
+                raise HTTPException(status_code=400, detail=f"Expected a .pdf file, got '{ext}'.")
+            renamed = work_dir / f"input-{i}.pdf"
+            input_path.rename(renamed)
+            _check_decompression_bomb(renamed, ".pdf")
+            input_paths.append(renamed)
+
+        request_id = _new_pdf_request_id(request, "merge", file_count=len(input_paths))
+        output_path = work_dir / "output.pdf"
+        _run_pdf_operation(
+            "merge", request_id, lambda: pdf_utilities.merge_pdfs(input_paths, output_path)
+        )
+        return _pdf_response(output_path, "merged.pdf")
+    finally:
+        storage.release(work_dir)
+
+
+@app.post("/api/v1/pdf/split", dependencies=[Depends(require_api_key)])
+def pdf_split(request: Request, file: UploadFile, ranges: str | None = Form(None)) -> Response:
+    """
+    Splits into multiple PDFs, returned as one ZIP. `ranges`:
+    semicolon-separated groups, each a comma/dash page spec (e.g.
+    "1-2;3;4-5") -- one output file per group, in the given page order
+    within each group. Omit for the default: one file per page.
+    """
+    _check_rate_limit(request)
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_path, ext = _require_pdf_upload(request, file, work_dir)
+        _check_decompression_bomb(input_path, ext)
+        request_id = _new_pdf_request_id(request, "split")
+
+        parsed_ranges = None
+        if ranges:
+            with fitz.open(str(input_path)) as doc:
+                page_count = len(doc)
+            try:
+                parsed_ranges = [
+                    pdf_utilities.parse_page_spec(part, page_count)
+                    for part in ranges.split(";")
+                    if part.strip()
+                ]
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
+        out_dir = work_dir / "parts"
+        out_dir.mkdir()
+        parts = _run_pdf_operation(
+            "split", request_id, lambda: pdf_utilities.split_pdf(input_path, out_dir, parsed_ranges)
+        )
+
+        zip_path = work_dir / "output.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for part_path in parts:
+                zf.write(part_path, part_path.name)
+        return Response(
+            content=zip_path.read_bytes(),
+            media_type="application/zip",
+            headers={"Content-Disposition": "attachment; filename=split.zip"},
+        )
+    finally:
+        storage.release(work_dir)
+
+
+@app.post("/api/v1/pdf/extract", dependencies=[Depends(require_api_key)])
+def pdf_extract(request: Request, file: UploadFile, pages: str = Form(...)) -> Response:
+    """Writes one new PDF containing just `pages` (e.g. "1,3,5-7"), in
+    the given order -- may reorder or repeat pages."""
+    _check_rate_limit(request)
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_path, ext = _require_pdf_upload(request, file, work_dir)
+        _check_decompression_bomb(input_path, ext)
+        request_id = _new_pdf_request_id(request, "extract")
+
+        with fitz.open(str(input_path)) as doc:
+            page_count = len(doc)
+        try:
+            page_list = pdf_utilities.parse_page_spec(pages, page_count)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        output_path = work_dir / "output.pdf"
+        _run_pdf_operation(
+            "extract",
+            request_id,
+            lambda: pdf_utilities.extract_pages(input_path, output_path, page_list),
+        )
+        return _pdf_response(output_path, "extracted.pdf")
+    finally:
+        storage.release(work_dir)
+
+
+@app.post("/api/v1/pdf/reorder", dependencies=[Depends(require_api_key)])
+def pdf_reorder(request: Request, file: UploadFile, order: str = Form(...)) -> Response:
+    """Writes a new PDF with pages in the given order (e.g. "3,1,2") --
+    `order` must name every page exactly once; use extract for a subset."""
+    _check_rate_limit(request)
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_path, ext = _require_pdf_upload(request, file, work_dir)
+        _check_decompression_bomb(input_path, ext)
+        request_id = _new_pdf_request_id(request, "reorder")
+
+        with fitz.open(str(input_path)) as doc:
+            page_count = len(doc)
+        try:
+            order_list = pdf_utilities.parse_page_spec(order, page_count)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        output_path = work_dir / "output.pdf"
+        _run_pdf_operation(
+            "reorder",
+            request_id,
+            lambda: pdf_utilities.reorder_pages(input_path, output_path, order_list),
+        )
+        return _pdf_response(output_path, "reordered.pdf")
+    finally:
+        storage.release(work_dir)
+
+
+@app.post("/api/v1/pdf/delete-pages", dependencies=[Depends(require_api_key)])
+def pdf_delete_pages(request: Request, file: UploadFile, pages: str = Form(...)) -> Response:
+    """Writes a new PDF with `pages` (e.g. "2,4") removed."""
+    _check_rate_limit(request)
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_path, ext = _require_pdf_upload(request, file, work_dir)
+        _check_decompression_bomb(input_path, ext)
+        request_id = _new_pdf_request_id(request, "delete-pages")
+
+        with fitz.open(str(input_path)) as doc:
+            page_count = len(doc)
+        try:
+            page_list = pdf_utilities.parse_page_spec(pages, page_count)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        output_path = work_dir / "output.pdf"
+        _run_pdf_operation(
+            "delete-pages",
+            request_id,
+            lambda: pdf_utilities.delete_pages(input_path, output_path, page_list),
+        )
+        return _pdf_response(output_path, "deleted.pdf")
+    finally:
+        storage.release(work_dir)
+
+
+@app.post("/api/v1/pdf/rotate", dependencies=[Depends(require_api_key)])
+def pdf_rotate(
+    request: Request, file: UploadFile, degrees: int = Form(...), pages: str | None = Form(None)
+) -> Response:
+    """Rotates `pages` (e.g. "1,3"; every page if omitted) clockwise by
+    `degrees` (must be a multiple of 90)."""
+    _check_rate_limit(request)
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_path, ext = _require_pdf_upload(request, file, work_dir)
+        _check_decompression_bomb(input_path, ext)
+        request_id = _new_pdf_request_id(request, "rotate", degrees=degrees)
+
+        page_list = None
+        if pages:
+            with fitz.open(str(input_path)) as doc:
+                page_count = len(doc)
+            try:
+                page_list = pdf_utilities.parse_page_spec(pages, page_count)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
+        output_path = work_dir / "output.pdf"
+        _run_pdf_operation(
+            "rotate",
+            request_id,
+            lambda: pdf_utilities.rotate_pages(input_path, output_path, degrees, page_list),
+        )
+        return _pdf_response(output_path, "rotated.pdf")
+    finally:
+        storage.release(work_dir)
+
+
+@app.post("/api/v1/pdf/watermark", dependencies=[Depends(require_api_key)])
+def pdf_watermark(request: Request, file: UploadFile, text: str = Form(...)) -> Response:
+    """Stamps `text` diagonally, semi-transparent, across every page."""
+    _check_rate_limit(request)
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_path, ext = _require_pdf_upload(request, file, work_dir)
+        _check_decompression_bomb(input_path, ext)
+        request_id = _new_pdf_request_id(request, "watermark")
+
+        output_path = work_dir / "output.pdf"
+        _run_pdf_operation(
+            "watermark",
+            request_id,
+            lambda: pdf_utilities.add_watermark(input_path, output_path, text),
+        )
+        return _pdf_response(output_path, "watermarked.pdf")
+    finally:
+        storage.release(work_dir)
+
+
+@app.post("/api/v1/pdf/add-page-numbers", dependencies=[Depends(require_api_key)])
+def pdf_add_page_numbers(request: Request, file: UploadFile, start: int = Form(1)) -> Response:
+    """Stamps a page number at the bottom-center of every page,
+    starting from `start`."""
+    _check_rate_limit(request)
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_path, ext = _require_pdf_upload(request, file, work_dir)
+        _check_decompression_bomb(input_path, ext)
+        request_id = _new_pdf_request_id(request, "add-page-numbers")
+
+        output_path = work_dir / "output.pdf"
+        _run_pdf_operation(
+            "add-page-numbers",
+            request_id,
+            lambda: pdf_utilities.add_page_numbers(input_path, output_path, start),
+        )
+        return _pdf_response(output_path, "numbered.pdf")
+    finally:
+        storage.release(work_dir)
+
+
+@app.post("/api/v1/pdf/crop", dependencies=[Depends(require_api_key)])
+def pdf_crop(
+    request: Request,
+    file: UploadFile,
+    left: float = Form(0),
+    top: float = Form(0),
+    right: float = Form(0),
+    bottom: float = Form(0),
+) -> Response:
+    """Crops every page inward by the given margins, in points (72 per inch)."""
+    _check_rate_limit(request)
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_path, ext = _require_pdf_upload(request, file, work_dir)
+        _check_decompression_bomb(input_path, ext)
+        request_id = _new_pdf_request_id(request, "crop")
+
+        output_path = work_dir / "output.pdf"
+        _run_pdf_operation(
+            "crop",
+            request_id,
+            lambda: pdf_utilities.crop_pages(input_path, output_path, (left, top, right, bottom)),
+        )
+        return _pdf_response(output_path, "cropped.pdf")
+    finally:
+        storage.release(work_dir)
+
+
+@app.post("/api/v1/pdf/compress", dependencies=[Depends(require_api_key)])
+def pdf_compress(request: Request, file: UploadFile) -> Response:
+    """Re-saves with structural cleanup and stream compression -- see
+    pdf_utilities.compress_pdf's own note on when this does and doesn't
+    meaningfully shrink a file."""
+    _check_rate_limit(request)
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_path, ext = _require_pdf_upload(request, file, work_dir)
+        _check_decompression_bomb(input_path, ext)
+        request_id = _new_pdf_request_id(request, "compress")
+
+        output_path = work_dir / "output.pdf"
+        _run_pdf_operation(
+            "compress", request_id, lambda: pdf_utilities.compress_pdf(input_path, output_path)
+        )
+        return _pdf_response(output_path, "compressed.pdf")
+    finally:
+        storage.release(work_dir)
+
+
+@app.post("/api/v1/pdf/repair", dependencies=[Depends(require_api_key)])
+def pdf_repair(request: Request, file: UploadFile) -> Response:
+    """Re-saves a PDF through PyMuPDF's own parser, repairing many
+    structural issues as a side effect of successfully opening the file
+    at all. A file too damaged for PyMuPDF to open at all fails at the
+    upload-validation step above, before this even runs."""
+    _check_rate_limit(request)
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_path, ext = _require_pdf_upload(request, file, work_dir)
+        # Deliberately no _check_decompression_bomb call here: a PDF
+        # damaged enough to need repair may not have a reliable page
+        # count to check in the first place, and the whole point of this
+        # endpoint is to accept a PDF other checks might reject.
+        request_id = _new_pdf_request_id(request, "repair")
+
+        output_path = work_dir / "output.pdf"
+        _run_pdf_operation(
+            "repair", request_id, lambda: pdf_utilities.repair_pdf(input_path, output_path)
+        )
+        return _pdf_response(output_path, "repaired.pdf")
+    finally:
+        storage.release(work_dir)
 
 
 @app.exception_handler(Exception)
