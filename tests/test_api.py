@@ -941,3 +941,72 @@ def test_job_html_to_pdf_end_to_end(libreoffice_cmd, monkeypatch, tmp_path):
     finally:
         doc.close()
     assert MARKER_TEXT in text
+
+
+# --------------------------------------------------------------------------
+# Phase 10 (master directive numbering): PDF -> Office (DOCX/PPTX).
+# --------------------------------------------------------------------------
+
+
+def test_capabilities_endpoint_lists_pdf_to_office_but_not_a_duplicate_xlsx():
+    pairs = {
+        (c["source_format"], c["target_format"]) for c in client.get("/api/v1/capabilities").json()
+    }
+    assert ("pdf_document", "docx") in pairs
+    assert ("pdf_document", "pptx") in pairs
+    # See test_registry.py's own note: PDF -> XLSX is already
+    # ("scanned_document", "xlsx")'s job -- registering a second,
+    # generic-LibreOffice-import one would collide, not just duplicate.
+    assert ("pdf_document", "xlsx") not in pairs
+
+
+@requires_libreoffice
+def test_convert_pdf_to_docx_end_to_end(libreoffice_cmd, monkeypatch):
+    from docx import Document
+
+    monkeypatch.setattr(config, "LIBREOFFICE_CMD", libreoffice_cmd)
+    resp = client.post(
+        "/api/v1/convert",
+        data={"target": "docx"},
+        files={"file": ("doc.pdf", io.BytesIO(_tiny_pdf_bytes()), "application/pdf")},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+
+    Document(io.BytesIO(resp.content))  # raises if this isn't a genuinely valid docx
+    # Checks the raw XML, not document.paragraphs -- see
+    # test_libreoffice_conversions.py's matching test and
+    # pdf_to_docx.py's own docstring: LibreOffice's PDF import places
+    # recovered text in a floating text-box shape, not a flowing
+    # paragraph, confirmed against a real converted file.
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        document_xml = zf.read("word/document.xml").decode("utf-8")
+    assert "API test page." in document_xml
+
+
+@requires_libreoffice
+def test_convert_pdf_to_pptx_end_to_end(libreoffice_cmd, monkeypatch):
+    from pptx import Presentation
+
+    monkeypatch.setattr(config, "LIBREOFFICE_CMD", libreoffice_cmd)
+    resp = client.post(
+        "/api/v1/convert",
+        data={"target": "pptx"},
+        files={"file": ("doc.pdf", io.BytesIO(_tiny_pdf_bytes()), "application/pdf")},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    )
+
+    prs = Presentation(io.BytesIO(resp.content))
+    assert len(prs.slides) >= 1
+    all_text = "\n".join(
+        shape.text_frame.text
+        for slide in prs.slides
+        for shape in slide.shapes
+        if shape.has_text_frame
+    )
+    assert "API test page." in all_text

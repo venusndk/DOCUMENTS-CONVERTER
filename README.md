@@ -39,6 +39,8 @@ documents_converter/
         office_to_pdf.py              Word/Excel/PowerPoint -> PDF (LibreOffice)
         html_to_pdf.py                HTML -> PDF (LibreOffice)
         markdown_to_pdf.py            Markdown -> HTML -> PDF (LibreOffice)
+        pdf_to_docx.py                 PDF -> DOCX (LibreOffice, Phase 10)
+        pdf_to_pptx.py                 PDF -> PPTX (LibreOffice, Phase 10)
         _libreoffice.py               shared LibreOffice-headless conversion helper
     api/
         app.py                       minimal synchronous HTTP API (see below)
@@ -65,9 +67,10 @@ tests/
     test_document_analysis.py          document analysis unit tests
     test_searchable_pdf.py             searchable-PDF conversion unit tests
     test_pdf_conversions.py            PDF->images/text unit tests (Phase 9)
-    test_libreoffice_conversions.py    Office/HTML/Markdown->PDF tests (Phase 9,
-                                      @requires_libreoffice -- skips locally, runs
-                                      in Docker/CI)
+    test_libreoffice_conversions.py    Office/HTML/Markdown->PDF (Phase 9) and
+                                      PDF->DOCX/PPTX (Phase 10) tests --
+                                      @requires_libreoffice, skips locally, runs
+                                      in Docker/CI
     test_frontend.py                   real-browser (Playwright) frontend tests
     fixtures/synthetic_scan.py        generates a fabricated (no real data) test PDF
     fixtures/synthetic_invoice.py     fabricated invoice-style table, saved as WEBP
@@ -170,7 +173,11 @@ end with a real browser: `tests/test_frontend.py` drives an actual image
 through the dropdown to `target=pdf` and checks the downloaded file is a
 real, correctly-sized PDF — not just that the dropdown renders.
 
-### Status colors (Phase 10)
+### Status colors (this project's own numbering — see note below)
+
+*This section's "Phase 10" predates switching to the master directive's
+own phase numbers (used from "Core Conversion Engine" onward, below) —
+it is not the same Phase 10 as "PDF → Office" further down.*
 
 The page's one status display (`#status`) uses a centralized semantic
 color system, defined once as CSS custom properties in `index.html` and
@@ -209,7 +216,7 @@ without hardcoding another special case into the API layer (`if ext ==
 every conversion after the first). Both `/api/v1/convert` and
 `/api/v1/jobs` route through it via an optional `target` field.
 
-Eight capabilities are registered today:
+Ten capabilities are registered today:
 
 | source format      | target            | accepts                                       | what it does                          |
 |---------------------|-------------------|--------------------------------------------------|----------------------------------------|
@@ -221,6 +228,15 @@ Eight capabilities are registered today:
 | `office_document`    | `pdf`             | `.docx .doc .xlsx .xls .pptx .ppt`            | Word/Excel/PowerPoint → PDF, via LibreOffice headless |
 | `html`               | `pdf`             | `.html .htm`                                  | HTML → PDF, via LibreOffice headless |
 | `markdown`           | `pdf`             | `.md .markdown`                               | Markdown → HTML (the `markdown` package) → PDF |
+| `pdf_document`       | `docx`            | `.pdf`                                        | PDF → DOCX, via LibreOffice headless (Phase 10 completion) |
+| `pdf_document`       | `pptx`            | `.pdf`                                        | PDF → PPTX, via LibreOffice headless (Phase 10 completion) |
+
+Deliberately no `pdf_document` → `xlsx`: that pair already exists as
+`scanned_document` → `xlsx`, a genuinely better implementation (OCR +
+purpose-built table detection) for that specific direction than a
+generic LibreOffice import would be — registering a second one wouldn't
+just be redundant, it would collide (both would claim `.pdf` for the
+same target).
 
 WEBP support (Phase 8 completion, master directive numbering) needed its
 own magic-byte check (`documents_converter/api/security.py`): WEBP's
@@ -280,6 +296,36 @@ Fine for the job-queue pattern this service already uses; a
 higher-throughput deployment would want a persistent LibreOffice
 listener (`--accept=socket,...`) instead, not built here since nothing
 about this project's current scale needs it yet.
+
+### PDF → Office (Phase 10 completion, master directive numbering)
+
+PDF → DOCX and PDF → PPTX, same LibreOffice-headless engine as Phase 9,
+just the reverse direction (`--convert-to docx`/`pptx` instead of
+`pdf`). PDF → XLSX is deliberately **not** a new capability — see the
+capability table above for why registering one would collide with the
+existing, better `scanned_document` → `xlsx` pipeline.
+
+Two real findings from this phase, found and fixed against an actual
+running Docker container, not assumed to work like the PDF-producing
+direction:
+- LibreOffice's default PDF handling opens it as a **Draw** document,
+  which has no docx/pptx export filter at all — it fails with "no
+  export filter found" on stdout while still **exiting 0**. Converting
+  *from* a PDF needs an explicit `--infilter=writer_pdf_import` (for
+  docx) or `--infilter=impress_pdf_import` (for pptx) to force the PDF
+  through Writer's/Impress's own import instead — and that flag must be
+  one combined `--infilter=NAME` argument; passing the name as a
+  separate argv entry is rejected outright.
+- Quality is genuinely asymmetric with the PDF-producing direction:
+  reconstructing an *editable* document from a fixed-layout PDF is
+  best-effort. Confirmed against a real converted file: recovered text
+  lands in a **floating text-box shape** anchored at the PDF's original
+  coordinates (preserving visual layout), not a flowing body paragraph
+  — so a plain `document.paragraphs` scan (python-docx) won't find it
+  even though the text is genuinely there and editable; PPTX's
+  equivalent (`shape.text_frame.text`, python-pptx) does see it
+  directly. A complex layout, or a scanned/image-only PDF, degrades
+  further toward embedding the original page images.
 
 `GET /api/v1/capabilities` reports this list live, from the registry
 itself, so it can't drift out of sync with what the server actually does:
@@ -486,6 +532,12 @@ curl.exe -F "target=text" -F "file=@transcript.pdf" http://127.0.0.1:8000/api/v1
 curl.exe -F "target=pdf" -F "file=@report.docx" http://127.0.0.1:8000/api/v1/convert -o report.pdf
 curl.exe -F "target=pdf" -F "file=@page.html" http://127.0.0.1:8000/api/v1/convert -o page.pdf
 curl.exe -F "target=pdf" -F "file=@notes.md" http://127.0.0.1:8000/api/v1/convert -o notes.pdf
+```
+
+Synchronous examples, Phase 10 completion (PDF → Office):
+```powershell
+curl.exe -F "target=docx" -F "file=@report.pdf" http://127.0.0.1:8000/api/v1/convert -o report.docx
+curl.exe -F "target=pptx" -F "file=@report.pdf" http://127.0.0.1:8000/api/v1/convert -o report.pptx
 ```
 
 Async example:

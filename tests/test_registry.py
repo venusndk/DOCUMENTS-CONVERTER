@@ -112,3 +112,12 @@ def test_the_real_registry_has_the_registered_capabilities():
     assert ("office_document", "pdf") in pairs
     assert ("html", "pdf") in pairs
     assert ("markdown", "pdf") in pairs
+    # Phase 10 (master directive numbering): PDF -> Office. Note there is
+    # deliberately no ("pdf_document", "xlsx") -- PDF -> XLSX is already
+    # covered by ("scanned_document", "xlsx")'s OCR + table-detection
+    # pipeline, a genuinely better implementation for that specific
+    # (source, target) pair than a generic LibreOffice import would be;
+    # registering a second, worse one isn't just redundant, it would
+    # collide (both accept .pdf for the same target).
+    assert ("pdf_document", "docx") in pairs
+    assert ("pdf_document", "pptx") in pairs
