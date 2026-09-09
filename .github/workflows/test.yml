@@ -65,4 +65,24 @@ jobs:
         run: playwright install chromium --with-deps
 
       - name: Run tests
-        run: pytest tests/ -v
+        run: |
+          set -o pipefail
+          pytest tests/ -v 2>&1 | tee pytest_output.txt
+
+      # Debugging aid added while chasing a real, CI-only Phase 14
+      # failure (master directive numbering: Job Queue & Real-Time
+      # Processing) that a truncated inline step log kept hiding the
+      # actual cause of. The inline log view truncates large steps and
+      # downloading the full job log requires repo admin/write access,
+      # which this session doesn't have -- an uploaded artifact has a
+      # separate, more permissive access model and can be fetched
+      # programmatically regardless. Uploads on every run, pass or
+      # fail (if: always()), not just on failure, so this stays useful
+      # without needing a special-cased conditional.
+      - name: Upload full test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-output
+          path: pytest_output.txt
+          retention-days: 5
