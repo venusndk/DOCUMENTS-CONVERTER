@@ -23,3 +23,12 @@ beautifulsoup4==4.9.3
 # handles the HTML -> PDF half -- see that module and _libreoffice.py).
 # Pure Python, no system dependencies of its own.
 markdown==3.10.3
+
+# Phase 12 (master directive numbering): Document Security. Real,
+# tamper-evident PDF digital signing/verification (documents_converter/
+# pdf_security.py) -- PyMuPDF alone has no signing support. `cryptography`
+# is already pyHanko's own dependency; listed explicitly since this
+# project's code imports it directly too (to build the ephemeral demo
+# signing certificate).
+pyhanko==0.37.0
+cryptography==49.0.0

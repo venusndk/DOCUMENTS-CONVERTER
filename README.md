@@ -430,6 +430,101 @@ somewhere in an extraction:
   page's width/height first, not the far corner, so the correct budget
   is `min(width, height) * sqrt(2)`, not the raw diagonal.
 
+### Document Security (Phase 12 completion, master directive numbering)
+
+Password protection, encryption, and permissions are one PyMuPDF
+feature (`documents_converter/pdf_security.py`, no new dependency):
+the PDF standard security handler, AES-256. Redaction is also pure
+PyMuPDF, via its native redact-annotation mechanism — content within a
+redacted region is genuinely removed from the file, not covered by a
+black box drawn on top of it. Digital signing is a different kind of
+problem: real, tamper-evident signing needs an actual cryptographic
+signing library, not just a PDF-manipulation one, so this phase adds
+**pyHanko** (a real, maintained PDF-signing/validation library) plus
+`cryptography` (already one of pyHanko's own dependencies) — a
+deliberate, disclosed dependency addition, the same kind of informed
+cost/benefit call as Phase 9's LibreOffice.
+
+| Endpoint | Parameters | Returns |
+|---|---|---|
+| `POST /api/v1/pdf/protect` | `file`, `user_password` and/or `owner_password`, optional `permissions` (comma-separated, e.g. `print,copy`) | PDF encrypted with AES-256 |
+| `POST /api/v1/pdf/unlock` | `file`, `password` | PDF with encryption removed |
+| `POST /api/v1/pdf/redact` | `file`, `terms` (comma-separated search strings) and/or `rects` (semicolon-separated `page,left,top,right,bottom`) | PDF with matched content permanently removed |
+| `POST /api/v1/pdf/sign` | `file`, optional `reason`/`location`, optional `pkcs12_file` + `pkcs12_password` | PDF with a real digital signature added |
+| `POST /api/v1/pdf/verify-signatures` | `file` | JSON report on every embedded signature |
+
+Same conventions as Phase 11's PDF Utilities: `X-API-Key` when
+`API_KEYS` is configured, `.pdf`-only input rejected before any real
+work, and a `pdf_utility_requested`/`_completed`/`_failed` audit event
+per call (operation name and outcome only — a password is never
+written to the audit log, and never logged at all).
+
+**Password protection / encryption / permissions.** At least one of
+`user_password` (required to open the file) or `owner_password`
+(required to change security settings or exceed the granted
+permissions) is required — encryption with neither password set would
+protect nothing. A `permissions` restriction only has teeth once
+there's an owner password backing it (see `protect_pdf`'s docstring for
+why); `POST /api/v1/pdf/unlock` reverses it given a password that
+authenticates as either user or owner.
+
+**Redaction.** `terms` does a case-sensitive search on every page via
+PyMuPDF's own text search and redacts every match; `rects` targets
+explicit regions regardless of their text content (useful for photos,
+signatures, or a table cell). A `terms` search that matches nothing
+raises rather than silently redacting zero occurrences — a caller
+walking away believing "I redacted the SSN" when nothing was actually
+removed is a real harm this project isn't willing to risk for a
+security-sensitive operation.
+
+**Signing — the trust model, stated plainly rather than left to be
+assumed.** Without `pkcs12_file`, `/sign` uses this server process's own
+demo signing identity (`pdf_security.generate_demo_signer`): a 2048-bit
+RSA key and a self-signed certificate generated once in memory the
+first time signing is requested, never written to disk, different every
+time the process restarts. What the demo certificate does **not**
+provide is identity: it has no chain to any trust root, so
+`verify-signatures` always reports `trusted: false` for it, correctly —
+there is no basis for a verifier to believe "Documents Converter Demo
+Signer" refers to this deployment, let alone a real person or
+organization. Real, identity-bound signing means supplying
+`pkcs12_file` (a `.pfx`/`.p12` certificate+key bundle from a CA your
+verifiers already trust) and `pkcs12_password` if it's encrypted.
+
+What it **does** provide is genuine tamper-evidence, and getting that
+disclosed correctly took a real bug fix, not just a docstring: the
+first version of `/verify-signatures` only exposed pyHanko's combined
+`trusted`/`bottom_line` verdict, which is *always* false for a
+demo-signed file regardless of tampering (an untrusted signer alone
+forces it) — so signing a file, tampering with its visible content
+afterward via a legitimate PDF mechanism (an incremental update, the
+same way a second signature would normally be added), and checking
+`bottom_line` looked like tamper-evidence working, when in fact the
+field couldn't distinguish "untrusted" from "untrusted AND tampered" at
+all. Caught before shipping by testing the untampered case first and
+finding `bottom_line` was already false there too. Fixed by adding a
+dedicated `modified_after_signing` field, driven by pyHanko's
+diff-analysis `modification_level` rather than its combined verdict —
+confirmed for real against a live container: signing a file, calling
+`/verify-signatures` (`modified_after_signing: false`), tampering with
+it, and calling `/verify-signatures` again (`modified_after_signing:
+true`, `trusted` unchanged at `false` throughout).
+
+Signature verification is fully offline by design (no revocation/CRL/
+OCSP fetching) — a verifier reaching out to a URL embedded in someone
+else's uploaded file is its own risk this project isn't taking on; a
+deployment that wants a specific CA's signatures to verify as trusted
+would need to pass that CA's certificate as a trust root, not currently
+exposed as an API parameter.
+
+`POST /api/v1/pdf/verify-signatures` isn't one of the master directive's
+five named Document Security sub-items (password protection,
+encryption, redaction, signing, permissions) — added anyway as a
+disclosed, natural complement: a signing endpoint with no way to check
+what it produced would be a half-built feature, the same reasoning that
+led Phase 7 to pair its preview endpoint with review-correction
+endpoints.
+
 ## Document analysis (Phase 4 completion)
 
 `documents_converter/document_analysis.py` inspects a PDF or image and

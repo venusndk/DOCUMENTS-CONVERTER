@@ -73,6 +73,22 @@ parameter (a rotation angle, a page spec, watermark text) a single
 job-queue variant, since every operation here is a fast, local,
 in-process PyMuPDF call with nothing for that machinery to buy.
 
+Phase 12 (master directive numbering) added POST /api/v1/pdf/protect,
+/unlock, /redact, /sign, and /verify-signatures (pdf_security.py):
+password protection, encryption, and permissions (one PyMuPDF feature),
+real content-removing redaction, and real cryptographic PDF signing via
+pyHanko -- an ephemeral, self-signed demo certificate by default
+(genuine tamper-evidence, no identity trust -- see
+pdf_security.generate_demo_signer's docstring) or a caller-supplied
+PKCS#12 certificate for identity-bound signing. /verify-signatures isn't
+one of the master directive's five named sub-items for this phase, but
+a signing endpoint with no way to check a signature would be a
+half-built feature; added as a natural, disclosed complement to it, the
+same way Phase 7's review-correction endpoints followed naturally from
+its preview endpoint. Same family conventions as Phase 11: synchronous
+only, .pdf-only input, its own request/response helpers reusing
+_run_pdf_operation's audit logging and error mapping.
+
 Run locally:
     uvicorn documents_converter.api.app:app --reload
 """
@@ -104,7 +120,7 @@ from .jobs import Job, JobStore
 from .rate_limit import FixedWindowRateLimiter
 from .storage import storage
 from .. import converters  # noqa: F401 -- import for its registration side effect only
-from .. import pdf_utilities
+from .. import pdf_security, pdf_utilities
 from ..document_analysis import analyze
 from ..ocr_excel import _is_suspicious, check_tesseract_available
 from ..registry import Capability, registry
@@ -1182,6 +1198,203 @@ def pdf_repair(request: Request, file: UploadFile) -> Response:
             "repair", request_id, lambda: pdf_utilities.repair_pdf(input_path, output_path)
         )
         return _pdf_response(output_path, "repaired.pdf")
+    finally:
+        storage.release(work_dir)
+
+
+# --------------------------------------------------------------------------
+# Phase 12 (master directive numbering): Document Security.
+# --------------------------------------------------------------------------
+
+
+def _parse_redact_rects(spec: str) -> list[tuple[int, float, float, float, float]]:
+    """Parses "page,left,top,right,bottom;page,left,top,right,bottom;..."
+    (1-indexed page, PDF points) into pdf_security.redact_pdf's expected
+    0-indexed-page rect list. Same semicolon-separates-groups convention
+    as pdf_split's `ranges` parameter."""
+    rects = []
+    for group in spec.split(";"):
+        group = group.strip()
+        if not group:
+            continue
+        parts = [p.strip() for p in group.split(",")]
+        if len(parts) != 5:
+            raise ValueError(
+                f"Invalid rect '{group}' -- expected 'page,left,top,right,bottom'."
+            )
+        try:
+            page, left, top, right, bottom = (float(p) for p in parts)
+        except ValueError:
+            raise ValueError(f"Invalid rect '{group}' -- all five values must be numbers.") from None
+        rects.append((int(page) - 1, left, top, right, bottom))
+    return rects
+
+
+@app.post("/api/v1/pdf/protect", dependencies=[Depends(require_api_key)])
+def pdf_protect(
+    request: Request,
+    file: UploadFile,
+    user_password: str | None = Form(None),
+    owner_password: str | None = Form(None),
+    permissions: str | None = Form(None),
+) -> Response:
+    """Encrypts the PDF (AES-256) with a user and/or owner password, and
+    optionally a permission restriction (comma-separated names -- see
+    pdf_security.PERMISSION_NAMES) enforced once there's an owner
+    password protecting it. See pdf_security.protect_pdf's docstring for
+    why at least one password is required and how owner/user passwords
+    interact."""
+    _check_rate_limit(request)
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_path, ext = _require_pdf_upload(request, file, work_dir)
+        _check_decompression_bomb(input_path, ext)
+        request_id = _new_pdf_request_id(
+            request,
+            "protect",
+            has_user_password=bool(user_password),
+            has_owner_password=bool(owner_password),
+        )
+
+        def _do() -> None:
+            perm_mask = (
+                pdf_security.parse_permissions(
+                    [p for p in permissions.split(",") if p.strip()]
+                )
+                if permissions
+                else None
+            )
+            pdf_security.protect_pdf(
+                input_path,
+                output_path,
+                user_password=user_password,
+                owner_password=owner_password,
+                permissions=perm_mask,
+            )
+
+        output_path = work_dir / "output.pdf"
+        _run_pdf_operation("protect", request_id, _do)
+        return _pdf_response(output_path, "protected.pdf")
+    finally:
+        storage.release(work_dir)
+
+
+@app.post("/api/v1/pdf/unlock", dependencies=[Depends(require_api_key)])
+def pdf_unlock(request: Request, file: UploadFile, password: str = Form(...)) -> Response:
+    """Removes password protection from a PDF, given a password that
+    successfully authenticates as either user or owner. The password
+    itself is never written to the audit log."""
+    _check_rate_limit(request)
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_path, ext = _require_pdf_upload(request, file, work_dir)
+        _check_decompression_bomb(input_path, ext)
+        request_id = _new_pdf_request_id(request, "unlock")
+
+        output_path = work_dir / "output.pdf"
+        _run_pdf_operation(
+            "unlock",
+            request_id,
+            lambda: pdf_security.remove_protection(input_path, output_path, password),
+        )
+        return _pdf_response(output_path, "unlocked.pdf")
+    finally:
+        storage.release(work_dir)
+
+
+@app.post("/api/v1/pdf/redact", dependencies=[Depends(require_api_key)])
+def pdf_redact(
+    request: Request,
+    file: UploadFile,
+    terms: str | None = Form(None),
+    rects: str | None = Form(None),
+) -> Response:
+    """Permanently removes content -- not a black box drawn over
+    content that is still there underneath (see pdf_security.redact_pdf's
+    docstring). `terms`: comma-separated, case-sensitive search strings,
+    redacted everywhere they occur. `rects`: semicolon-separated explicit
+    regions, each "page,left,top,right,bottom" (1-indexed page, PDF
+    points). At least one of the two is required."""
+    _check_rate_limit(request)
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_path, ext = _require_pdf_upload(request, file, work_dir)
+        _check_decompression_bomb(input_path, ext)
+        request_id = _new_pdf_request_id(request, "redact")
+
+        def _do() -> int:
+            term_list = [t.strip() for t in terms.split(",") if t.strip()] if terms else None
+            rect_list = _parse_redact_rects(rects) if rects else None
+            return pdf_security.redact_pdf(input_path, output_path, terms=term_list, rects=rect_list)
+
+        output_path = work_dir / "output.pdf"
+        _run_pdf_operation("redact", request_id, _do)
+        return _pdf_response(output_path, "redacted.pdf")
+    finally:
+        storage.release(work_dir)
+
+
+@app.post("/api/v1/pdf/sign", dependencies=[Depends(require_api_key)])
+def pdf_sign(
+    request: Request,
+    file: UploadFile,
+    reason: str | None = Form(None),
+    location: str | None = Form(None),
+    field_name: str = Form("Signature1"),
+    pkcs12_password: str | None = Form(None),
+    pkcs12_file: UploadFile | None = File(None),
+) -> Response:
+    """
+    Adds a real, cryptographic digital signature. Without `pkcs12_file`,
+    signs with this server process's ephemeral, self-signed demo
+    certificate (see pdf_security.generate_demo_signer's docstring for
+    exactly what that does and doesn't prove -- tamper-evidence, not
+    identity). Pass `pkcs12_file` (a .pfx/.p12 certificate+key bundle,
+    with `pkcs12_password` if it's encrypted) for real, identity-bound
+    signing once you have a certificate from a CA your verifiers trust.
+    """
+    _check_rate_limit(request)
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_path, ext = _require_pdf_upload(request, file, work_dir)
+        _check_decompression_bomb(input_path, ext)
+        request_id = _new_pdf_request_id(request, "sign", using_custom_cert=pkcs12_file is not None)
+
+        def _do() -> None:
+            if pkcs12_file is not None:
+                pkcs12_bytes = pkcs12_file.file.read()
+                signer = pdf_security.load_pkcs12_signer(pkcs12_bytes, pkcs12_password)
+            else:
+                signer = pdf_security.generate_demo_signer()
+            pdf_security.sign_pdf(
+                input_path, output_path, signer, reason=reason, location=location, field_name=field_name
+            )
+
+        output_path = work_dir / "output.pdf"
+        _run_pdf_operation("sign", request_id, _do)
+        return _pdf_response(output_path, "signed.pdf")
+    finally:
+        storage.release(work_dir)
+
+
+@app.post("/api/v1/pdf/verify-signatures", dependencies=[Depends(require_api_key)])
+def pdf_verify_signatures(request: Request, file: UploadFile) -> dict:
+    """Reports on every digital signature embedded in the PDF -- see
+    pdf_security.verify_pdf's docstring for exactly what each field
+    means, in particular why `trusted` is expected to be False for a
+    demo-signed file. An empty `signatures` list is a normal result for
+    an unsigned PDF, not an error."""
+    _check_rate_limit(request)
+    work_dir = storage.allocate("docconv-pdfutil-")
+    try:
+        input_path, ext = _require_pdf_upload(request, file, work_dir)
+        _check_decompression_bomb(input_path, ext)
+        request_id = _new_pdf_request_id(request, "verify-signatures")
+
+        signatures = _run_pdf_operation(
+            "verify-signatures", request_id, lambda: pdf_security.verify_pdf(input_path)
+        )
+        return {"signatures": signatures}
     finally:
         storage.release(work_dir)
 
