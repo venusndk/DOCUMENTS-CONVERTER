@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import sys
@@ -170,6 +171,21 @@ def _rq_worker_thread():
     from documents_converter.api import job_queue
     from rq.worker import SimpleWorker
 
+    # This fixture polls every ~1s for the entire test session, and
+    # every single poll -- even one that finds nothing queued -- logs a
+    # full worker lifecycle at INFO (registering, subscribing to its
+    # pubsub channel, "*** Listening...", acquiring the scheduler lock,
+    # unsubscribing, "done, quitting"). Confirmed the hard way in CI,
+    # not just suspected: a real run's "Run tests" step was truncated
+    # for exceeding GitHub Actions' per-step log size limit, entirely
+    # full of these idle-poll cycles with the actual failure (if any)
+    # pushed out of the visible/retained log. Quieted to WARNING here
+    # rather than trying to reduce poll frequency alone, since even a
+    # slower interval still accumulates to a large volume of pure noise
+    # over a multi-minute session.
+    logging.getLogger("rq.worker").setLevel(logging.WARNING)
+    logging.getLogger("rq.scheduler").setLevel(logging.WARNING)
+
     class _ThreadSafeWorker(SimpleWorker):
         """SimpleWorker.work() unconditionally installs SIGINT/SIGTERM
         handlers, which raises ValueError("signal only works in main
@@ -205,7 +221,7 @@ def _rq_worker_thread():
             # long-lived scheduler process, which would be the wrong
             # model for a polling loop like this one anyway.
             worker.work(burst=True, with_scheduler=True)
-            stop_event.wait(0.2)
+            stop_event.wait(0.5)
 
     thread = threading.Thread(target=_run, daemon=True, name="test-rq-worker")
     thread.start()
