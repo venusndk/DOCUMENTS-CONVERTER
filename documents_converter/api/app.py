@@ -73,6 +73,20 @@ parameter (a rotation angle, a page spec, watermark text) a single
 job-queue variant, since every operation here is a fast, local,
 in-process PyMuPDF call with nothing for that machinery to buy.
 
+Phase 13 (master directive numbering) added POST /api/v1/batch and GET
+/api/v1/batch/{id}[/download] (batch.py): multi-file upload under one
+shared `target`, each file an ordinary job on the same JobStore/
+_run_job/_convert_executor pipeline POST /api/v1/jobs already uses --
+batch.py's BatchRecord is deliberately just the list of job ids
+submitted together, not a parallel job-execution system. "Safe
+concurrency" means exactly that reuse: a batch's files share the same
+4-worker executor every other conversion already competes for, so one
+large batch can't starve the rest of the service. A file that fails
+validation is recorded as its own failed job immediately, without
+blocking the rest of the batch from being queued -- individual failure
+reporting, both from the status endpoint's per-file manifest and
+bundled into the downloaded ZIP's manifest.json.
+
 Phase 12 (master directive numbering) added POST /api/v1/pdf/protect,
 /unlock, /redact, /sign, and /verify-signatures (pdf_security.py):
 password protection, encryption, and permissions (one PyMuPDF feature),
@@ -115,6 +129,7 @@ import fitz
 
 from . import audit, config, security
 from .auth import require_api_key
+from .batch import Batch, BatchStore
 from .db import check_db_connection
 from .jobs import Job, JobStore
 from .rate_limit import FixedWindowRateLimiter
@@ -194,6 +209,7 @@ _rate_limiter = FixedWindowRateLimiter(
     window_seconds=config.RATE_LIMIT_WINDOW_SECONDS,
 )
 _job_store = JobStore(retention_seconds=config.JOB_RETENTION_SECONDS)
+_batch_store = BatchStore(retention_seconds=config.JOB_RETENTION_SECONDS)
 # Shared by both the sync endpoint and the async job runner -- see module
 # docstring for the resulting known limitation. Also what actually gives
 # the sync endpoint a wall-clock timeout ("best-effort" because Python has
@@ -806,6 +822,181 @@ def submit_job_review(job_id: str, corrections: list[dict]) -> dict:
 
     audit.log_event("review_corrections_applied", job_id=job.id, count=applied)
     return {"applied": applied}
+
+
+# --------------------------------------------------------------------------
+# Phase 13 (master directive numbering): Batch Processing.
+# --------------------------------------------------------------------------
+
+
+def _batch_manifest(batch: Batch) -> list[dict]:
+    """Per-file status for a batch -- job order preserved, exactly as
+    submitted, and each entry only as much as its own job knows about
+    itself. A referenced job that no longer exists (JobStore's own
+    retention cleanup ran before this batch's) is reported as its own
+    distinct status rather than silently skipped or mistaken for a job
+    that is still queued."""
+    entries = []
+    for job_id in batch.job_ids:
+        job = _job_store.get(job_id)
+        if job is None:
+            entries.append({"job_id": job_id, "status": "expired"})
+            continue
+        entry = {"job_id": job.id, "status": job.status}
+        if job.error:
+            entry["error"] = job.error
+        entries.append(entry)
+    return entries
+
+
+def _batch_overall_status(manifest: list[dict]) -> str:
+    statuses = {entry["status"] for entry in manifest}
+    if statuses <= {"completed"}:
+        return "completed"
+    if statuses <= {"failed", "expired"}:
+        return "failed"
+    if statuses <= {"completed", "failed", "expired"}:
+        return "completed_with_errors"
+    if "processing" in statuses:
+        return "processing"
+    return "queued"
+
+
+@app.post("/api/v1/batch", dependencies=[Depends(require_api_key)], status_code=202)
+def create_batch(request: Request, files: list[UploadFile] = File(...), target: str = Form("xlsx")) -> dict:
+    """
+    Accepts multiple files under one `target`, queuing each as its own
+    ordinary job on the exact same background pipeline POST
+    /api/v1/jobs uses (_run_job, the shared _convert_executor -- see
+    batch.py's module docstring for why that's what "safe concurrency"
+    means for a batch: still capped at the same 4-at-a-time limit every
+    other conversion already shares, not a separate uncapped pool).
+
+    Per-file failure reporting starts immediately, not just at the end:
+    a file that fails validation (wrong extension for `target`, bad
+    magic bytes, a decompression-bomb page/pixel count) is recorded as
+    its own failed job right away and does NOT prevent the rest of the
+    batch's files from being validated and queued -- one bad file in a
+    batch of fifty should cost that one file, not the other forty-nine.
+    Poll GET /api/v1/batch/{batch_id} for progress, GET .../download
+    once every file has reached a terminal state.
+    """
+    _check_rate_limit(request)
+    if not files:
+        raise HTTPException(status_code=400, detail="Batch needs at least 1 file.")
+
+    job_ids = []
+    for file in files:
+        job = _job_store.create()
+        work_dir = storage.allocate(f"docconv-job-{job.id}-")
+        job.work_dir = work_dir
+        job_ids.append(job.id)
+
+        try:
+            input_path, ext = _validate_and_save_upload(request, file, work_dir)
+            capability = _resolve_capability(ext, target)
+            _check_decompression_bomb(input_path, ext)
+        except HTTPException as e:
+            storage.release(work_dir)
+            _job_store.update(job.id, status="failed", error=str(e.detail))
+            continue
+        except security.FileTooLargeError as e:
+            storage.release(work_dir)
+            _job_store.update(job.id, status="failed", error=str(e))
+            continue
+
+        output_path = work_dir / f"output{capability.output_extension}"
+        _job_store.update(
+            job.id,
+            result_media_type=capability.media_type,
+            result_filename=f"converted{capability.output_extension}",
+        )
+        request_id = uuid.uuid4().hex[:12]
+        audit.log_event(
+            "job_created",
+            request_id=request_id,
+            job_id=job.id,
+            endpoint="batch",
+            source_format=capability.source_format,
+            target_format=capability.target_format,
+            ext=ext,
+            size_bytes=input_path.stat().st_size,
+            client_ip=_client_ip(request),
+            auth_enforced=bool(config.API_KEYS),
+        )
+        _convert_executor.submit(_run_job, job, input_path, output_path, ext, capability, request_id)
+
+    batch = _batch_store.create(target, job_ids)
+    audit.log_event(
+        "batch_created",
+        batch_id=batch.id,
+        total=batch.total,
+        client_ip=_client_ip(request),
+        auth_enforced=bool(config.API_KEYS),
+    )
+    return {"batch_id": batch.id, "total": batch.total, "job_ids": job_ids}
+
+
+@app.get("/api/v1/batch/{batch_id}", dependencies=[Depends(require_api_key)])
+def get_batch_status(batch_id: str) -> dict:
+    """Aggregated progress: overall `status` (queued/processing/
+    completed/completed_with_errors/failed -- see _batch_overall_status),
+    per-file counts, and the full per-file manifest (_batch_manifest)."""
+    batch = _batch_store.get(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="Batch not found.")
+
+    manifest = _batch_manifest(batch)
+    counts: dict[str, int] = {}
+    for entry in manifest:
+        counts[entry["status"]] = counts.get(entry["status"], 0) + 1
+    return {
+        "batch_id": batch.id,
+        "status": _batch_overall_status(manifest),
+        "total": batch.total,
+        "counts": counts,
+        "files": manifest,
+    }
+
+
+@app.get("/api/v1/batch/{batch_id}/download", dependencies=[Depends(require_api_key)])
+def get_batch_download(batch_id: str) -> Response:
+    """
+    One ZIP: every successfully completed file's result (named by its
+    job id, keeping each file's own extension), plus a manifest.json at
+    the ZIP root with every file's status (including failures and their
+    error messages) -- individual failure reporting travels with the
+    results, not just a separate status-check call. 409 while any file
+    is still queued/processing, the same "not ready yet" convention as
+    GET /api/v1/jobs/{id}/result.
+    """
+    batch = _batch_store.get(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="Batch not found.")
+
+    manifest = _batch_manifest(batch)
+    overall = _batch_overall_status(manifest)
+    if overall in ("queued", "processing"):
+        raise HTTPException(status_code=409, detail=f"Batch is '{overall}', not finished yet.")
+
+    work_dir = storage.allocate("docconv-batch-zip-")
+    try:
+        zip_path = work_dir / "batch-results.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for job_id in batch.job_ids:
+                job = _job_store.get(job_id)
+                if job is not None and job.status == "completed" and job.result_path:
+                    zf.writestr(f"{job_id}{job.result_filename[job.result_filename.rfind('.'):]}", job.result_path.read_bytes())
+            zf.writestr("manifest.json", json.dumps({"batch_id": batch.id, "files": manifest}, indent=2))
+        data = zip_path.read_bytes()
+    finally:
+        storage.release(work_dir)
+
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=batch-results.zip"},
+    )
 
 
 # --------------------------------------------------------------------------
