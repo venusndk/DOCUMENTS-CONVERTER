@@ -1,16 +1,43 @@
 """
-SQLAlchemy ORM models -- currently just the one table this project
-actually has an immediate, concrete use for. See jobs.py's module
-docstring for why the job store is the first (and, for now, only) thing
-migrated onto real persistence rather than adding tables speculatively.
+SQLAlchemy ORM models -- only tables this project has an immediate,
+concrete use for. See jobs.py's module docstring for why the job store
+was the first thing migrated onto real persistence rather than adding
+tables speculatively. BatchRecord (Phase 13, master directive
+numbering) is the second, added for the same reason: batch processing
+needs its jobs' groupings to survive a restart exactly as much as the
+jobs themselves already do.
 """
 
 from __future__ import annotations
 
-from sqlalchemy import Float, String, Text
+from sqlalchemy import Float, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
+
+
+class BatchRecord(Base):
+    """Phase 13 (master directive numbering): Batch Processing. A batch
+    is deliberately thin -- just the ordered list of JobRecord ids it
+    fanned out to, plus the shared `target` every file in it was
+    converted to. Each file's actual conversion state (queued/
+    processing/completed/failed, its error, its result) lives entirely
+    in the existing JobRecord row for that file; this table exists only
+    so a group of jobs created together can be found and reported on
+    together (documents_converter/api/batch.py), not to duplicate any
+    state JobRecord already owns."""
+
+    __tablename__ = "batches"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    target: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Comma-separated job ids (JobRecord.id is a plain hex uuid4 with no
+    # comma in it, so this needs no escaping) -- one extra column, not a
+    # whole child table, for what's really just an ordered list with no
+    # per-row query needs of its own.
+    job_ids: Mapped[str] = mapped_column(Text, nullable=False)
+    total: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class JobRecord(Base):

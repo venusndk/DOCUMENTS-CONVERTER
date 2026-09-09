@@ -525,6 +525,46 @@ what it produced would be a half-built feature, the same reasoning that
 led Phase 7 to pair its preview endpoint with review-correction
 endpoints.
 
+### Batch Processing (Phase 13 completion, master directive numbering)
+
+`POST /api/v1/batch` accepts multiple files under one shared `target`
+and queues each as its own ordinary job on the exact same background
+pipeline `POST /api/v1/jobs` already uses (`documents_converter/api/
+batch.py`'s `BatchRecord` is deliberately just the list of job ids
+submitted together, not a second job-execution system).
+
+| Endpoint | Parameters | Returns |
+|---|---|---|
+| `POST /api/v1/batch` | `files` (2+ uploads), `target` | `202`, `{batch_id, total, job_ids}` |
+| `GET /api/v1/batch/{id}` | — | overall `status`, per-status `counts`, and a per-file manifest |
+| `GET /api/v1/batch/{id}/download` | — | one ZIP: every completed file's result (named by job id) + `manifest.json` |
+
+**"Safe concurrency" means reuse, not a second pool.** A batch's files
+are submitted to the exact same 4-worker `_convert_executor` every
+other conversion already shares — a 50-file batch still only ever runs
+4 conversions at once, the same limit a single caller already lives
+under, so one large batch can't starve every other request the service
+is handling.
+
+**Individual failure reporting starts at submission, not just at the
+end.** A file that fails validation (wrong extension for `target`, bad
+magic bytes, a decompression-bomb page/pixel count) is recorded as its
+own failed job immediately and does **not** block the rest of the
+batch from being validated and queued — confirmed with a test that
+submits one valid file and one that can't possibly satisfy `target` in
+the same request: the valid file completes, the other reports `failed`
+with its own error message, and the batch's overall status becomes
+`completed_with_errors` (`queued`/`processing`/`completed`/`failed`
+round out the possible values) — never a single bad file taking the
+whole batch down. The downloaded ZIP's `manifest.json` carries the same
+per-file status/error information, so a caller who only fetches the
+ZIP still gets individual failure reporting, not just the successful
+files with failures silently dropped.
+
+`GET .../download` returns `409` while any file is still queued or
+processing — the same "not ready yet" convention as
+`GET /api/v1/jobs/{id}/result`.
+
 ## Document analysis (Phase 4 completion)
 
 `documents_converter/document_analysis.py` inspects a PDF or image and
