@@ -11,15 +11,33 @@ level of abstraction for what this project needs (see rq_tasks.py and
 app.py's batch/job endpoints for how they're used), so wrapping them
 further would only be indirection with nothing behind it.
 
-Neither `get_redis_connection()` nor `get_queue()` connects eagerly --
-redis-py and RQ both connect lazily, on the first real command -- so
-importing this module (which every request handler does, via app.py)
-never fails just because Redis happens to be unreachable at import
-time. The failure that matters (Redis actually unreachable) surfaces at
-the one call site that needs a live connection: `queue.enqueue(...)`,
-inside app.py's create_job/create_batch, both of which already handle
-it as a 503 rather than an unhandled exception -- see their
+Constructing `redis.Redis.from_url(...)` doesn't connect eagerly --
+redis-py connects lazily, on the first real command -- so importing
+this module (which every request handler does, via app.py) never fails
+just because Redis happens to be unreachable at import time. The
+failure that matters (Redis actually unreachable) surfaces at the one
+call site that needs a live connection: `queue.enqueue(...)`, inside
+app.py's create_job/create_batch, both of which already handle it as a
+503 rather than an unhandled exception -- see their
 _enqueue_conversion_job docstring.
+
+`get_redis_connection()` returns one shared, lazily-created client for
+the whole process, not a fresh one per call -- confirmed the wrong way
+first: an earlier version built a brand-new `redis.Redis` (a brand-new
+connection pool, not a shared one -- a fresh client object never reuses
+another instance's pool no matter how good redis-py's own pooling is)
+on every single call, and the one caller that calls this in a tight
+loop -- app.py's GET .../events, polling roughly every 0.5s for up to
+several minutes per open connection -- could rack up hundreds of
+never-explicitly-closed connections over one long-lived SSE request.
+Implicated (not conclusively proven, but never reproduced again after
+fixing it) in a real CI failure: a background test worker (tests/
+conftest.py) that stopped processing every job for the rest of a
+session partway through a real run, right as a handful of long-lived
+SSE tests would have been accumulating exactly this kind of connection
+pressure. redis.Redis instances are explicitly documented as
+thread-safe and meant to be shared -- this is the intended usage, not
+a workaround.
 """
 
 from __future__ import annotations
@@ -36,16 +54,19 @@ from . import config
 #: backend and models.py's two tables.
 QUEUE_NAME = "conversions"
 
+_connection: redis.Redis | None = None
+
 
 def get_redis_connection() -> redis.Redis:
-    return redis.Redis.from_url(config.REDIS_URL)
+    global _connection
+    if _connection is None:
+        _connection = redis.Redis.from_url(config.REDIS_URL)
+    return _connection
 
 
 def get_queue() -> Queue:
-    """A fresh Queue bound to a fresh connection on every call, rather
-    than one shared module-level instance -- cheap (redis-py connections
-    are pooled internally per client instance, and constructing a Queue
-    object does no I/O), and it sidesteps any question of whether a
-    long-lived Queue's connection survives a Redis restart across this
-    process's lifetime."""
+    """A fresh Queue object on every call (constructing one does no
+    I/O and holds no resources of its own -- it's just a thin wrapper
+    around the queue name and the shared connection above), bound to
+    the one shared connection rather than a new one each time."""
     return Queue(QUEUE_NAME, connection=get_redis_connection())

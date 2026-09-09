@@ -207,20 +207,40 @@ def _rq_worker_thread():
     def _run() -> None:
         worker = _ThreadSafeWorker([job_queue.get_queue()], connection=job_queue.get_redis_connection())
         while not stop_event.is_set():
-            # with_scheduler=True: without it, a job retried with a
-            # nonzero Retry(interval=...) (rq_tasks.py's automatic
-            # retry) gets scheduled for later rather than re-queued
-            # immediately, and nothing ever promotes it back to the
-            # real queue -- confirmed the hard way (see
-            # worker_main.py's identical note, added after this exact
-            # gap left a retry-then-succeed test stuck on "queued"
-            # forever despite the interval having long since elapsed).
-            # burst=True keeps this call's own scheduler pass a single
-            # one-shot sweep (acquire lock, promote anything due,
-            # release, return) rather than spawning a separate
-            # long-lived scheduler process, which would be the wrong
-            # model for a polling loop like this one anyway.
-            worker.work(burst=True, with_scheduler=True)
+            try:
+                # with_scheduler=True: without it, a job retried with a
+                # nonzero Retry(interval=...) (rq_tasks.py's automatic
+                # retry) gets scheduled for later rather than re-queued
+                # immediately, and nothing ever promotes it back to the
+                # real queue -- confirmed the hard way (see
+                # worker_main.py's identical note, added after this exact
+                # gap left a retry-then-succeed test stuck on "queued"
+                # forever despite the interval having long since elapsed).
+                # burst=True keeps this call's own scheduler pass a single
+                # one-shot sweep (acquire lock, promote anything due,
+                # release, return) rather than spawning a separate
+                # long-lived scheduler process, which would be the wrong
+                # model for a polling loop like this one anyway.
+                worker.work(burst=True, with_scheduler=True)
+            except Exception:
+                # A raised exception here (a transient Redis hiccup, a
+                # scheduler lock race under CI's different timing/load --
+                # never reproduced locally, but confirmed for real in CI:
+                # a run failed 21 tests in a row, every one stuck at
+                # "queued" forever, immediately after a stretch that
+                # otherwise passed -- the exact signature of this loop
+                # dying partway through the session and never recovering,
+                # since an uncaught exception in a background thread just
+                # kills that thread silently) must never take the whole
+                # loop down with it. Every @requires_redis test for the
+                # rest of the session depends on this thread staying
+                # alive; one bad iteration should cost that iteration,
+                # not every job submitted afterward. Printed (not
+                # swallowed silently) so a real, recurring problem is
+                # still visible in captured test output.
+                import traceback
+
+                traceback.print_exc()
             stop_event.wait(0.5)
 
     thread = threading.Thread(target=_run, daemon=True, name="test-rq-worker")
