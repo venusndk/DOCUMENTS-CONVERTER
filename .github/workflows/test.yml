@@ -13,6 +13,23 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Phase 14 (master directive numbering): tests/conftest.py's
+    # @requires_redis-marked tests need a real, live Redis -- a service
+    # container, not installed via apt like Tesseract/LibreOffice above,
+    # since GitHub Actions ships this as a first-class feature for
+    # exactly this case (no image build, no separate lifecycle
+    # management -- it's up before the first step runs and torn down
+    # with the job automatically).
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 

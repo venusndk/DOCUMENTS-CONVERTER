@@ -14,6 +14,8 @@ Risk Register / File Security, directive section 28). Two distinct checks:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 MAGIC_SIGNATURES: dict[str, tuple[bytes, ...]] = {
     ".pdf": (b"%PDF",),
     ".png": (b"\x89PNG\r\n\x1a\n",),
@@ -97,3 +99,50 @@ def check_image_dimensions(width: int, height: int) -> None:
 def check_pdf_page_count(n_pages: int) -> None:
     if n_pages > MAX_PDF_PAGES:
         raise FileTooLargeError(f"PDF has {n_pages} pages, over the {MAX_PDF_PAGES} page limit.")
+
+
+#: Raster formats check_decompression_bomb below actually opens and
+#: measures. Shared with app.py's /api/v1/analyze (which needs the same
+#: set to decide whether it can inspect a given upload at all).
+IMAGE_BOMB_CHECK_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"})
+
+
+def check_decompression_bomb(input_path: Path, ext: str) -> None:
+    """
+    Checks the parsed/decompressed size (PDF page count, image pixel
+    dimensions) before the expensive OCR/conversion pipeline runs.
+    Raises FileTooLargeError if it's over the configured limit.
+
+    Lives here (not in app.py, where it originated) as of Phase 14
+    (master directive numbering): documents_converter/api/rq_tasks.py's
+    RQ-executed task needs this exact check too, and must not import
+    app.py (a worker process has no reason to construct the FastAPI app
+    at all) -- so this is the one shared place both app.py and
+    rq_tasks.py import it from, instead of two copies drifting apart.
+
+    Phase 9 (master directive numbering) added Office documents (.docx/
+    .xlsx/.pptx and their legacy binary equivalents), HTML, and Markdown
+    as acceptable inputs -- none of them get a decompression check here.
+    HTML/Markdown are plain text with nothing to decompress. Office
+    documents (ZIP containers, like every OOXML format) genuinely CAN be
+    zip-bombed, same class of risk as any ZIP-based format -- not
+    covered by a check here yet. Real, disclosed gap, not silently
+    assumed safe: the raw upload size limit (config.MAX_UPLOAD_MB) and
+    the overall conversion timeout (config.CONVERT_TIMEOUT_SECONDS,
+    which every capability's call already runs under) are the only
+    protection today. Dedicated malicious-file/zip-bomb testing for
+    these formats is master directive Phase 19's job (Performance &
+    Security Hardening), not this one's.
+    """
+    if ext == ".pdf":
+        import fitz
+
+        doc = fitz.open(str(input_path))
+        n_pages = len(doc)
+        doc.close()
+        check_pdf_page_count(n_pages)
+    elif ext in IMAGE_BOMB_CHECK_EXTENSIONS:
+        from PIL import Image as PILImage
+
+        with PILImage.open(input_path) as img:
+            check_image_dimensions(*img.size)

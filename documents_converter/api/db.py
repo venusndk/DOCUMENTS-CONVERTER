@@ -20,6 +20,8 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from . import config
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 class Base(DeclarativeBase):
     pass
@@ -74,3 +76,39 @@ def check_db_connection() -> bool:
         return True
     except Exception:
         return False
+
+
+def run_migrations() -> None:
+    """
+    Applies any pending Alembic migrations against config.DATABASE_URL
+    at startup, so a fresh checkout (or a fresh container against a
+    fresh database) doesn't need a separate manual `alembic upgrade
+    head` step to become usable -- consistent with this project's
+    running "zero extra setup" bar for local/dev use.
+
+    Idempotent (upgrading an already-current database is a no-op),
+    which matters here since this can run every time a process starts,
+    not just once. As of Phase 14 (master directive numbering), two
+    independent processes call this at their own startup -- app.py's
+    FastAPI lifespan handler and worker_main.py's RQ worker entry point
+    -- specifically so docker-compose.yml's `api` and `worker`
+    containers have no startup-ordering dependency on each other for
+    this: whichever reaches the database first performs the migration,
+    the other's call is a no-op. Lives here, not in app.py (where it
+    originated before Phase 14), so worker_main.py can call it without
+    importing app.py and constructing the whole FastAPI app just for
+    this one function -- a worker process has no reason to do that.
+
+    For a deployment that runs multiple replicas against the same
+    database, running migrations as an explicit separate release step
+    instead (skip calling this, run `alembic upgrade head` once before
+    rolling out) avoids every replica racing to migrate on boot --
+    tracked as a known simplification for this single-instance-shaped
+    project, not silently assumed away.
+    """
+    from alembic import command
+    from alembic.config import Config as AlembicConfig
+
+    cfg = AlembicConfig(str(_REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(_REPO_ROOT / "migrations"))
+    command.upgrade(cfg, "head")

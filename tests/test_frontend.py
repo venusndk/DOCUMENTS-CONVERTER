@@ -23,7 +23,7 @@ import uvicorn
 from documents_converter.api import config
 from documents_converter.api.app import app
 
-from conftest import requires_tesseract
+from conftest import requires_redis, requires_tesseract
 
 _PORT = 8765
 
@@ -69,6 +69,7 @@ def test_index_page_loads_with_expected_elements(running_app_server):
 
 
 @requires_tesseract
+@requires_redis
 def test_frontend_full_upload_to_download_flow(running_app_server, synthetic_pdf, tmp_path):
     """
     The real end-to-end proof: a real headless browser loads the actual
@@ -123,6 +124,7 @@ def test_frontend_full_upload_to_download_flow(running_app_server, synthetic_pdf
 
 
 @requires_tesseract
+@requires_redis
 def test_frontend_review_lets_a_person_correct_a_cell_before_downloading(
     running_app_server, synthetic_pdf, tmp_path
 ):
@@ -238,6 +240,7 @@ def test_frontend_offers_a_target_choice_for_a_convertible_file(running_app_serv
             browser.close()
 
 
+@requires_redis
 def test_frontend_image_to_pdf_end_to_end(running_app_server, tmp_path):
     """
     The real proof this feature exists for: pick an image, explicitly
@@ -245,7 +248,9 @@ def test_frontend_image_to_pdf_end_to_end(running_app_server, tmp_path):
     xlsx default), click Convert, and get back a real, valid,
     correctly-sized PDF -- through the actual browser UI, not a direct
     API call. No OCR/Tesseract involved, so this doesn't need
-    @requires_tesseract.
+    @requires_tesseract -- it does need @requires_redis, though (Phase
+    14, master directive numbering): the frontend's Convert button goes
+    through POST /api/v1/jobs, which is now a real Redis/RQ queue.
     """
     from playwright.sync_api import sync_playwright
     from PIL import Image

@@ -64,6 +64,37 @@ JOB_RETENTION_SECONDS: float = float(os.environ.get("JOB_RETENTION_SECONDS", "36
 # should not be able to go live unauthenticated by omission.
 ENVIRONMENT: str = os.environ.get("ENVIRONMENT", "development")
 
+# Phase 14 (master directive numbering): Job Queue & Real-Time
+# Processing. Redis-backed job queue (RQ) replacing the in-process
+# ThreadPoolExecutor for /api/v1/jobs and /api/v1/batch -- a real,
+# separate worker process (documents_converter/api/worker_main.py,
+# docker-compose.yml's `worker` service) pulls jobs off this queue
+# instead of the API process running conversions on its own threads.
+# Local/dev default matches this project's other infra choices (SQLite
+# default DB, no LibreOffice on the dev machine): a fresh checkout with
+# no Redis running simply can't exercise the queue (see
+# tests/conftest.py's @requires_redis), same shape as the Tesseract/
+# LibreOffice gaps -- real verification happens in Docker Compose/CI,
+# not by silently faking it in-process.
+REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+
+# How many times RQ automatically retries a job that failed for a
+# transient/environment reason (not a bad-input error -- see
+# rq_tasks.py's run_conversion_job for that distinction). Retries use a
+# short backoff (rq_tasks.RETRY_INTERVALS), not immediate resubmission.
+JOB_MAX_RETRIES: int = int(os.environ.get("JOB_MAX_RETRIES", "2"))
+
+# When set, every job/batch/sync-conversion work directory is created
+# under this path instead of the OS default temp directory
+# (documents_converter/api/storage.py). Unset (the default) preserves
+# this project's original single-process behavior exactly. Required
+# once the API and worker are separate processes with separate
+# filesystems (different Docker containers, in particular): a worker
+# pulling a job off Redis has no access to a temp directory the API
+# container created under its own /tmp, so docker-compose.yml points
+# both containers' WORK_DIR_ROOT at the same shared volume.
+WORK_DIR_ROOT: str | None = os.environ.get("WORK_DIR_ROOT") or None
+
 # Phase 11: minimal audit trail (documents_converter/api/audit.py). Unset
 # by default -- the audit log always goes to stdout regardless (captured
 # by whatever log aggregation a real deployment already has); set this to

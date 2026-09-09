@@ -2,6 +2,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -87,6 +88,32 @@ def libreoffice_cmd() -> str:
     return LIBREOFFICE_CMD
 
 
+def _redis_is_reachable() -> bool:
+    """Phase 14 (master directive numbering): the job queue
+    (documents_converter/api/job_queue.py) needs a real, live Redis --
+    unlike Tesseract/LibreOffice, there's no "not installed" file-path
+    check possible here, just an actual connection attempt with a short
+    timeout so a genuinely absent Redis fails fast rather than hanging
+    the whole collection step."""
+    try:
+        import redis
+
+        from documents_converter.api import config
+
+        redis.Redis.from_url(config.REDIS_URL, socket_connect_timeout=1).ping()
+        return True
+    except Exception:
+        return False
+
+
+requires_redis = pytest.mark.skipif(
+    not _redis_is_reachable(),
+    reason="No live Redis reachable at REDIS_URL -- not installed on this project's own dev "
+    "machine (same gap as Tesseract/LibreOffice); real verification happens in Docker "
+    "Compose and CI, where a redis service container is provisioned.",
+)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _migrated_test_database():
     """
@@ -110,6 +137,81 @@ def _migrated_test_database():
     from documents_converter.api.app import _run_migrations
 
     _run_migrations()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _rq_worker_thread():
+    """
+    Phase 14 (master directive numbering): every @requires_redis test
+    enqueues a real job onto a real Redis queue -- unlike the
+    ThreadPoolExecutor this replaced, nothing processes that queue by
+    itself. Runs an RQ SimpleWorker in a background thread for the
+    whole test session so those tests' jobs actually complete.
+
+    SimpleWorker, not the regular Worker: SimpleWorker executes each
+    job in the worker's own process/thread instead of forking a child
+    one. Two reasons that matters here, not just one: Worker's
+    fork-per-job model doesn't exist on Windows (this project's own dev
+    machine) at all, and even where forking does work, a forked child
+    wouldn't see this test session's own monkeypatches (e.g.
+    test_get_job_result_409_before_job_completes's injected slow
+    conversion function) -- those only exist in this process's memory.
+
+    A no-op when Redis isn't reachable: every test that would need this
+    is already skipped via @requires_redis, so there is nothing for it
+    to do, and constructing a Queue/connection here unconditionally
+    would be pure overhead (and, if REDIS_URL pointed somewhere genuinely
+    unreachable rather than just "nothing listening", a slow one).
+    """
+    if not _redis_is_reachable():
+        yield
+        return
+
+    from documents_converter.api import job_queue
+    from rq.worker import SimpleWorker
+
+    class _ThreadSafeWorker(SimpleWorker):
+        """SimpleWorker.work() unconditionally installs SIGINT/SIGTERM
+        handlers, which raises ValueError("signal only works in main
+        thread") the moment it's called from anywhere but the main
+        thread -- confirmed the hard way (this fixture's first version
+        crashed on its very first burst, silently leaving every
+        @requires_redis test's job stuck "queued" forever, since a
+        crashed background thread doesn't fail the test that's waiting
+        on it, just hangs it until its own timeout). This test session
+        doesn't need OS-signal-based shutdown for a worker anyway (it's
+        stopped via `stop_event` below, not a signal), so the handler
+        installation is skipped entirely rather than worked around."""
+
+        def _install_signal_handlers(self):
+            pass
+
+    stop_event = threading.Event()
+
+    def _run() -> None:
+        worker = _ThreadSafeWorker([job_queue.get_queue()], connection=job_queue.get_redis_connection())
+        while not stop_event.is_set():
+            # with_scheduler=True: without it, a job retried with a
+            # nonzero Retry(interval=...) (rq_tasks.py's automatic
+            # retry) gets scheduled for later rather than re-queued
+            # immediately, and nothing ever promotes it back to the
+            # real queue -- confirmed the hard way (see
+            # worker_main.py's identical note, added after this exact
+            # gap left a retry-then-succeed test stuck on "queued"
+            # forever despite the interval having long since elapsed).
+            # burst=True keeps this call's own scheduler pass a single
+            # one-shot sweep (acquire lock, promote anything due,
+            # release, return) rather than spawning a separate
+            # long-lived scheduler process, which would be the wrong
+            # model for a polling loop like this one anyway.
+            worker.work(burst=True, with_scheduler=True)
+            stop_event.wait(0.2)
+
+    thread = threading.Thread(target=_run, daemon=True, name="test-rq-worker")
+    thread.start()
+    yield
+    stop_event.set()
+    thread.join(timeout=5)
 
 
 @pytest.fixture(scope="session")

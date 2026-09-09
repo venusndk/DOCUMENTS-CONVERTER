@@ -4,8 +4,15 @@ batch.py) -- Phase 13, master directive numbering (Batch Processing).
 
 Uses `target="text"` (pdf_document -> text, documents_converter/
 converters/pdf_to_text.py) against real, digital-text PDFs built with
-fitz directly -- fast and deterministic, no Tesseract/OCR involved, so
-these tests run everywhere this project's own test suite does.
+fitz directly -- fast and deterministic, no Tesseract/OCR involved.
+
+Every test that actually waits for a queued job/batch to complete is
+marked @requires_redis (Phase 14, master directive numbering: these
+now go through a real Redis/RQ queue, not an in-process thread pool --
+see tests/conftest.py's @requires_redis and documents_converter/api/
+job_queue.py). Same shape as the pre-existing @requires_tesseract/
+@requires_libreoffice gaps: not installed on this project's own dev
+machine, real verification happens in Docker Compose and CI.
 """
 
 from __future__ import annotations
@@ -19,6 +26,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from documents_converter.api.app import _rate_limiter, app
+
+from conftest import requires_redis
 
 client = TestClient(app)
 
@@ -55,6 +64,7 @@ def _wait_for_batch_terminal(batch_id: str, timeout: float = 30) -> dict:
     return body
 
 
+@requires_redis
 def test_create_batch_queues_every_file_and_all_complete():
     files = [
         ("files", ("a.pdf", io.BytesIO(_build_pdf_bytes("Alpha")), "application/pdf")),
@@ -79,6 +89,7 @@ def test_create_batch_requires_at_least_one_file():
     assert resp.status_code in (400, 422)
 
 
+@requires_redis
 def test_batch_reports_individual_failures_without_blocking_the_rest():
     """One file with an extension that can't satisfy `target` must be
     recorded as its own failed job, not abort the whole batch -- the
@@ -99,6 +110,7 @@ def test_batch_reports_individual_failures_without_blocking_the_rest():
     assert "error" in failed_entries[0]
 
 
+@requires_redis
 def test_batch_download_bundles_results_and_a_manifest():
     files = [
         ("files", ("good.pdf", io.BytesIO(_build_pdf_bytes("Valid")), "application/pdf")),
@@ -129,6 +141,7 @@ def test_batch_download_bundles_results_and_a_manifest():
         assert len(manifest["files"]) == 2
 
 
+@requires_redis
 def test_batch_download_409_before_finished(monkeypatch):
     def _slow_convert(*args, **kwargs):
         time.sleep(5)
