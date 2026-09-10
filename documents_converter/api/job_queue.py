@@ -60,7 +60,26 @@ _connection: redis.Redis | None = None
 def get_redis_connection() -> redis.Redis:
     global _connection
     if _connection is None:
-        _connection = redis.Redis.from_url(config.REDIS_URL)
+        # protocol=2 (RESP2): redis-py defaults to negotiating RESP3 via
+        # a HELLO command on connect, which only Redis 6+ understands.
+        # Found the hard way against this project's own local dev
+        # machine: its native Windows Redis (a years-old, unofficial
+        # port -- version 3.0.504) has no HELLO command at all, so
+        # every connection failed outright with "unknown command
+        # 'HELLO'" -- not a timeout, not a slow-to-notice degradation,
+        # a hard failure on the very first command. RESP2 has been
+        # supported by every Redis version this project could plausibly
+        # run against, old or new (including the redis:7-alpine used in
+        # Docker/Compose/CI), so this is strictly more compatible, not
+        # a downgrade for anyone already on a modern server.
+        # socket_connect_timeout=2: a real Redis should answer within a
+        # couple seconds; this is also what lets
+        # tests/conftest.py's @requires_redis check fail fast against a
+        # genuinely absent Redis instead of hanging on the OS's own,
+        # much longer TCP connect timeout during test collection.
+        _connection = redis.Redis.from_url(
+            config.REDIS_URL, protocol=2, socket_connect_timeout=2
+        )
     return _connection
 
 

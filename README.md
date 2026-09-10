@@ -644,18 +644,38 @@ at a shared location instead of each process's own OS temp directory —
 `docker-compose.yml`'s `work_data` volume, mounted at the same path in
 both the `api` and `worker` containers.
 
-**Local dev note:** like Tesseract and LibreOffice before it, Redis is
-not installed on this project's own dev machine — `tests/conftest.py`'s
-`@requires_redis` skips everything that needs a live one, and real
-verification happens in Docker Compose and CI (a `redis:7-alpine`
-service container, added to `.github/workflows/test.yml` for this
-phase — trivial to provision there, unlike Tesseract/LibreOffice, so
-there was no reason to leave these permanently skip-only). Tests that
-do run against a real Redis use an in-process RQ worker thread
-(`tests/conftest.py`), not a separate process — deliberately, so a
-test's own monkeypatched conversion function (used to simulate a slow
-or flaky conversion) is actually visible to the code that executes the
-job, which a genuinely separate worker process could never see.
+**Minimum Redis version: 4.0** (6+ recommended). RQ's own worker
+registration issues a multi-field `HSET` — one field-value pair was all
+`HSET` supported before Redis 4.0, and this project's own dev machine
+actually surfaced the consequence for real: it has a native Windows
+Redis installed, but it's version 3.0.504 (an unofficial, years-old
+port), and every job submitted against it failed permanently with
+`wrong number of arguments for 'hset' command` the moment a worker
+tried to register itself — not a slow degradation, every single job
+stuck at `queued` forever. `documents_converter/api/job_queue.py` also
+forces RESP2 (`protocol=2`) rather than letting redis-py negotiate
+RESP3 via `HELLO`, since that command doesn't exist before Redis 6.0
+either and failed outright (`unknown command 'HELLO'`) against the same
+old server — RESP2 works against both old and new Redis, so this is
+strictly more compatible, not a downgrade for anyone already on a
+modern one. `docker-compose.yml`'s `redis:7-alpine` and CI's service
+container are both comfortably past this floor; a local native install
+needs to be checked against it explicitly (`redis-cli INFO server`),
+since "Redis is installed" alone doesn't mean "is new enough."
+
+**Local dev note:** like Tesseract and LibreOffice before it, tests
+that need a live Redis skip on this project's own dev machine
+(`tests/conftest.py`'s `@requires_redis` — the machine's native Redis
+being too old counts as "not usable" here too) — real verification
+happens in Docker Compose and CI (a `redis:7-alpine` service container,
+added to `.github/workflows/test.yml` for this phase — trivial to
+provision there, unlike Tesseract/LibreOffice, so there was no reason
+to leave these permanently skip-only). Tests that do run against a real
+Redis use an in-process RQ worker thread (`tests/conftest.py`), not a
+separate process — deliberately, so a test's own monkeypatched
+conversion function (used to simulate a slow or flaky conversion) is
+actually visible to the code that executes the job, which a genuinely
+separate worker process could never see.
 
 ## Document analysis (Phase 4 completion)
 

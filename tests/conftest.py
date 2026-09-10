@@ -97,11 +97,13 @@ def _redis_is_reachable() -> bool:
     timeout so a genuinely absent Redis fails fast rather than hanging
     the whole collection step."""
     try:
-        import redis
+        from documents_converter.api.job_queue import get_redis_connection
 
-        from documents_converter.api import config
-
-        redis.Redis.from_url(config.REDIS_URL, socket_connect_timeout=1).ping()
+        # Same connection (protocol=2, etc. -- see job_queue.py's own
+        # notes) every real call site uses, not a separately constructed
+        # one that could quietly drift from it and answer a different
+        # question than "can the app actually talk to Redis".
+        get_redis_connection().ping()
         return True
     except Exception:
         return False
