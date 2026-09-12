@@ -109,6 +109,26 @@ def _redis_is_reachable() -> bool:
         return False
 
 
+def _gemini_key_configured() -> bool:
+    """Phase 16 (master directive numbering): AI Document Intelligence
+    needs a real GEMINI_API_KEY -- checked as plain presence, not a
+    live API call (unlike @requires_redis's real ping): a live call
+    here would cost real quota on every single test collection, for a
+    provider this project doesn't control the way it does a local
+    Tesseract/LibreOffice/Redis install."""
+    from documents_converter.api import config
+
+    return config.GEMINI_API_KEY is not None
+
+
+requires_gemini_key = pytest.mark.skipif(
+    not _gemini_key_configured(),
+    reason="No GEMINI_API_KEY configured -- same shape as Tesseract/LibreOffice/Redis: not "
+    "set up on this project's own dev machine by default, real verification happens "
+    "wherever a real key is actually provided.",
+)
+
+
 requires_redis = pytest.mark.skipif(
     not _redis_is_reachable(),
     reason="No live Redis reachable at REDIS_URL -- not installed on this project's own dev "

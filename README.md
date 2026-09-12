@@ -779,6 +779,99 @@ curl.exe -F "file=@scan.pdf" -F "page=2" http://127.0.0.1:8000/api/v1/preview
 curl.exe http://127.0.0.1:8000/api/v1/jobs/a1b2c3.../preview/pages/2 -o page2.png
 ```
 
+### AI Document Intelligence (Phase 16 completion, master directive numbering)
+
+Every previous phase inspects a document's *structure* — is it digital
+or scanned, what tables does it have, is a cell suspicious. Phase 16
+(`documents_converter/ai_intelligence.py`) is the first to actually
+read what a document *says*, via a real vision-language model: vision
+fallback, structured field extraction, summarization, translation, and
+intelligent classification. Explicitly optional/configurable, same
+shape as Tesseract/LibreOffice/Redis before it — unset by default, and
+every endpoint below checks `ai_intelligence.is_ai_available()` first
+and returns a clear `503` rather than failing unpredictably deep inside
+a request.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/ai/vision-extract` | Reads a page directly with a vision model — for text Tesseract's own OCR reads poorly (unusual fonts, handwriting, low-contrast scans) |
+| `POST /api/v1/ai/extract` | Given text or an image/PDF page and a comma-separated `fields` list, returns `{field: value}` — `null` for a field genuinely not present, never a guess |
+| `POST /api/v1/ai/summarize` | A plain-language summary of `text`, bounded to `max_sentences` |
+| `POST /api/v1/ai/translate` | Translates `text` into `target_language` |
+| `POST /api/v1/ai/classify` | What kind of document this is — a real semantic read, unlike `/api/v1/analyze`'s digital/scanned/mixed structural classification. `categories`, given as a comma-separated list, constrains the answer to exactly one of them |
+
+`vision-extract`, `extract`, and `classify` accept either a PDF (with a
+1-indexed `page`) or a plain image — the same upload validation and
+`document_preview.render_page_image` normalization `/api/v1/preview`
+already uses, not duplicated. `extract` and `classify` each require
+*exactly one* of `text` or `file` (`400` otherwise); text-based calls
+are rejected with `413` past `AI_MAX_TEXT_CHARS` rather than silently
+truncated, so a caller never gets a result that quietly ignored part of
+what it sent. A genuine upstream failure (the provider's own error —
+rate limit, network error) maps to `502`, distinct from this service's
+own `500`, and never leaks a raw stack trace, per this project's
+long-standing failure philosophy.
+
+```powershell
+curl.exe -F "file=@scan.png" http://127.0.0.1:8000/api/v1/ai/vision-extract
+curl.exe -F "text=Invoice #INV-7734, total due `$128.40" -F "fields=invoice_number,total_amount" `
+  http://127.0.0.1:8000/api/v1/ai/extract
+curl.exe -F "text=..." -F "max_sentences=2" http://127.0.0.1:8000/api/v1/ai/summarize
+curl.exe -F "text=Good morning" -F "target_language=French" http://127.0.0.1:8000/api/v1/ai/translate
+curl.exe -F "text=..." -F "categories=invoice,resume,poem" http://127.0.0.1:8000/api/v1/ai/classify
+```
+
+**Google Gemini, not Anthropic/Claude** — a deliberate, disclosed
+departure from this environment's own "default to the latest Claude
+models" guidance, made for a concrete, real reason found while building
+this phase: a genuine, correctly-authenticated Anthropic API key with
+zero credits purchased cannot make a single request (`Your credit
+balance is too low to access the Anthropic API` — a real `400` from the
+real API, not a guess). Gemini's free tier needs no billing or credit
+card at all. For a project whose own stated mission is usability
+without ongoing cost to whoever runs it, that difference decided the
+provider. `AI_MODEL` defaults to `gemini-3.6-flash`, not the more
+obvious first guess `gemini-2.5-flash` — that model was already retired
+for new accounts by the time this phase was built, confirmed against
+the real API's own error message (which named this replacement
+directly), not assumed from a cached model list.
+
+**A real bug found and fixed while verifying this phase:**
+`google-genai`'s `Client` closes its underlying `httpx` transport once
+the `Client` object itself is garbage-collected. The first version of
+`_client()` was called inline — `_client().models.generate_content(...)`
+— a bare temporary with no name holding it, so CPython's refcounting
+collected (and finalized/closed) the `Client` between the `.models`
+attribute access and the actual request, failing every single real call
+with `RuntimeError: Cannot send a request, as the client has been
+closed.` Reproduced outside pytest entirely (a standalone script hit
+the identical traceback) before ruling out test-fixture interference.
+Fixed by assigning `_client()` to a local variable first in every
+function, so a real reference outlives the call.
+
+**A real, disclosed limitation, not a bug:** Gemini's free tier caps
+`gemini-3.6-flash` at **20 requests/day per project** — the API's own
+`429` response names this explicitly
+(`quotaId=GenerateRequestsPerDayPerProjectPerModel-FreeTier,
+quotaValue=20`). Every one of this phase's real-API tests
+(`tests/test_ai_intelligence.py`, `tests/test_ai_api.py`) has been
+independently confirmed to pass for real; a `429`/`502` from one of
+them on a day the quota is already spent is that daily ceiling, not a
+regression. CI is unaffected — it never sets a real `GEMINI_API_KEY`,
+so these tests simply skip there, the same as Tesseract/LibreOffice/
+Redis being absent in some environments. A paid Gemini plan raises this
+considerably; this project doesn't require one.
+
+**Verified for real**, not just unit-tested: every one of the 5
+functions confirmed against the live Gemini API directly; the full
+`/api/v1/ai/*` request path confirmed against a real `docker compose`
+stack — `GEMINI_API_KEY` correctly unset by default (`503` from inside
+the real container), then set on the host shell before `docker compose
+up` and confirmed to actually reach the `api` container and reach
+Gemini for real (a `502` from the same daily quota ceiling above,
+correctly mapped and content-free-audit-logged rather than a raw
+`500`).
+
 ## HTTP API (optional)
 
 An API wraps the registry above, for anything that needs to call this over
@@ -1074,6 +1167,21 @@ load-bearing here, not incidental choices. Scale worker capacity
 independently of the API process with `docker compose up --build
 --scale worker=3`.
 
+`/api/v1/ai/*` (Phase 16, master directive numbering) is off by default
+here too — set `GEMINI_API_KEY` on the host shell before bringing the
+stack up to enable it, since `docker-compose.yml` passes it through
+rather than hardcoding it:
+
+```powershell
+$env:GEMINI_API_KEY = "..."
+docker compose up --build
+```
+
+Verified for real against a live stack: unset, `/api/v1/ai/summarize`
+correctly returns `503` from inside the real `api` container; set, the
+same request correctly reaches the real Gemini API from inside the
+container (confirmed via that container's own logs).
+
 ## Continuous integration
 
 `.github/workflows/test.yml` runs the full test suite on every push and
@@ -1104,7 +1212,13 @@ Tesseract, LibreOffice, and (Phase 14, master directive numbering) Redis
 -- and every test that needs one skips automatically
 (`@requires_tesseract`/`@requires_libreoffice`/`@requires_redis` in
 `tests/conftest.py`) rather than failing; all three run for real in
-Docker/Docker Compose and CI, where they're actually provisioned.
+Docker/Docker Compose and CI, where they're actually provisioned. A
+fourth, `@requires_gemini_key` (Phase 16, master directive numbering),
+is the same shape but different in kind: it's not something this
+project can provision in CI at all (a real, external, metered API), so
+these tests only ever run wherever a real `GEMINI_API_KEY` is actually
+set — see `tests/test_ai_intelligence.py`'s own docstring for the real,
+confirmed 20-requests/day free-tier ceiling that comes with doing that.
 
 ---
 

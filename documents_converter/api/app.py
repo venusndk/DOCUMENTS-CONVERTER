@@ -126,6 +126,22 @@ its preview endpoint. Same family conventions as Phase 11: synchronous
 only, .pdf-only input, its own request/response helpers reusing
 _run_pdf_operation's audit logging and error mapping.
 
+Phase 16 (master directive numbering) added POST /api/v1/ai/*:
+vision-extract, extract, summarize, translate, classify
+(documents_converter/ai_intelligence.py) -- a real semantic read of a
+document via Google Gemini, not just structural inspection (that's
+still document_analysis.py's job). Explicitly optional/configurable:
+every endpoint here checks ai_intelligence.is_ai_available() first and
+returns a clear 503 when GEMINI_API_KEY isn't set, the same shape as
+the job queue's own 503 when Redis is unreachable. vision-extract,
+extract, and classify accept a PDF (with `page`) or a plain image,
+reusing /api/v1/preview's own upload validation and
+document_preview.render_page_image normalization rather than
+duplicating it. A genuine upstream failure (the provider's own error,
+not this service's) maps to 502, distinct from this service's own 500.
+Google Gemini, not Anthropic/Claude, for a concrete, disclosed reason
+-- see ai_intelligence.py's and config.py's own docstrings.
+
 Run locally:
     uvicorn documents_converter.api.app:app --reload
 """
@@ -167,7 +183,7 @@ from .rq_tasks import run_conversion_job
 from .storage import storage
 from .. import converters  # noqa: F401 -- import for its registration side effect only
 from .. import pdf_security, pdf_utilities
-from .. import document_preview
+from .. import ai_intelligence, document_preview
 from ..document_analysis import analyze
 from ..ocr_excel import _is_suspicious, check_tesseract_available
 from ..registry import Capability, registry
@@ -531,6 +547,273 @@ def preview_document(request: Request, file: UploadFile, page: int = Form(1)) ->
         }
     finally:
         storage.release(work_dir)
+
+
+# --------------------------------------------------------------------------
+# Phase 16 (master directive numbering): AI Document Intelligence
+# --------------------------------------------------------------------------
+
+
+def _check_ai_available() -> None:
+    if not ai_intelligence.is_ai_available():
+        raise HTTPException(
+            status_code=503,
+            detail="AI features are not configured on this server (GEMINI_API_KEY is unset).",
+        )
+
+
+def _check_ai_text_length(text: str) -> None:
+    if len(text) > config.AI_MAX_TEXT_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Text exceeds the {config.AI_MAX_TEXT_CHARS}-character limit for AI features.",
+        )
+
+
+def _read_ai_image(request: Request, file: UploadFile, page: int, *, request_id: str, event_prefix: str) -> bytes:
+    """
+    Shared by every /api/v1/ai/* endpoint that accepts an image: same
+    upload validation as /api/v1/preview, then always normalized to PNG
+    via document_preview.render_page_image -- a caller can hand this
+    either a PDF (with `page`) or a plain image (page must be 1), same
+    as that endpoint already does.
+    """
+    work_dir = storage.allocate("docconv-ai-")
+    try:
+        input_path, ext = _validate_and_save_upload(request, file, work_dir)
+        if ext != ".pdf" and ext not in _IMAGE_BOMB_CHECK_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot read '{ext}' -- not a recognized PDF/image extension.",
+            )
+        try:
+            _check_decompression_bomb(input_path, ext)
+            return document_preview.render_page_image(input_path, ext, page)
+        except ValueError as e:
+            audit.log_event(f"{event_prefix}_failed", request_id=request_id, reason="invalid_input")
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except security.FileTooLargeError as e:
+            audit.log_event(f"{event_prefix}_failed", request_id=request_id, reason="file_too_large")
+            raise HTTPException(status_code=413, detail=str(e)) from e
+        except Exception as e:
+            print(f"[{request_id}] {event_prefix} image read failed: {e!r}")
+            audit.log_event(f"{event_prefix}_failed", request_id=request_id, reason="internal_error")
+            raise HTTPException(
+                status_code=500,
+                detail="Reading the uploaded document failed. This has been logged for investigation.",
+            ) from e
+    finally:
+        storage.release(work_dir)
+
+
+def _call_ai(request_id: str, event_prefix: str, fn: Callable[[], dict | str]):
+    """
+    Shared call-and-map-errors wrapper for the real Gemini request each
+    endpoint below makes. AIUnavailableError (a config race between
+    _check_ai_available() and this call) maps to 503, same as an
+    upfront unavailable check. Anything else here is a genuine failure
+    from the provider itself (rate limit, network error, malformed
+    response) -- this service is working correctly, so 502 (upstream
+    failure), not 500, and never a raw stack trace to the caller.
+    """
+    try:
+        return fn()
+    except ai_intelligence.AIUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except Exception as e:
+        print(f"[{request_id}] {event_prefix} failed: {e!r}")
+        audit.log_event(f"{event_prefix}_failed", request_id=request_id, reason="ai_provider_error")
+        raise HTTPException(
+            status_code=502,
+            detail="The AI provider request failed. This has been logged for investigation.",
+        ) from e
+
+
+@app.post("/api/v1/ai/vision-extract", dependencies=[Depends(require_api_key)])
+def ai_vision_extract(request: Request, file: UploadFile, page: int = Form(1)) -> dict:
+    """
+    Vision fallback: reads a page directly with a vision-capable model
+    (ai_intelligence.vision_extract) for text Tesseract's own OCR reads
+    poorly (unusual fonts, handwriting, low-contrast scans) -- not a
+    replacement for the normal, faster, free /convert or /jobs OCR
+    path. Accepts a PDF (with `page`) or a plain image, same
+    upload/normalization as /api/v1/preview. Returns plain text, not
+    structured data -- see /api/v1/ai/extract for that, given a real
+    field list.
+    """
+    _check_ai_available()
+    _check_rate_limit(request)
+
+    request_id = uuid.uuid4().hex[:12]
+    image_bytes = _read_ai_image(
+        request, file, page, request_id=request_id, event_prefix="ai_vision_extract"
+    )
+    audit.log_event(
+        "ai_vision_extract_requested",
+        request_id=request_id,
+        page=page,
+        client_ip=_client_ip(request),
+        auth_enforced=bool(config.API_KEYS),
+    )
+    text = _call_ai(
+        request_id, "ai_vision_extract", lambda: ai_intelligence.vision_extract(image_bytes)
+    )
+    audit.log_event("ai_vision_extract_completed", request_id=request_id, text_length=len(text))
+    return {"text": text}
+
+
+@app.post("/api/v1/ai/extract", dependencies=[Depends(require_api_key)])
+def ai_extract_structured(
+    request: Request,
+    fields: str = Form(...),
+    text: str | None = Form(None),
+    file: UploadFile | None = File(None),
+    page: int = Form(1),
+) -> dict:
+    """
+    Structured extraction: given plain text or an image/PDF page and a
+    comma-separated list of field names, returns a flat {field: value}
+    JSON object (ai_intelligence.extract_structured) -- `null` for a
+    field genuinely not present rather than a guessed value. Exactly
+    one of `text`/`file` must be given.
+    """
+    _check_ai_available()
+    _check_rate_limit(request)
+
+    if (text is None) == (file is None):
+        raise HTTPException(status_code=400, detail="Provide exactly one of `text` or `file`.")
+
+    field_list = [f.strip() for f in fields.split(",") if f.strip()]
+    if not field_list:
+        raise HTTPException(status_code=400, detail="`fields` must name at least one field.")
+
+    request_id = uuid.uuid4().hex[:12]
+    image_bytes = None
+    if file is not None:
+        image_bytes = _read_ai_image(
+            request, file, page, request_id=request_id, event_prefix="ai_extract"
+        )
+    else:
+        _check_ai_text_length(text)
+
+    audit.log_event(
+        "ai_extract_requested",
+        request_id=request_id,
+        field_count=len(field_list),
+        source="image" if image_bytes is not None else "text",
+        client_ip=_client_ip(request),
+        auth_enforced=bool(config.API_KEYS),
+    )
+    result = _call_ai(
+        request_id,
+        "ai_extract",
+        lambda: ai_intelligence.extract_structured(
+            text=text, image_bytes=image_bytes, fields=field_list
+        ),
+    )
+    audit.log_event("ai_extract_completed", request_id=request_id, field_count=len(field_list))
+    return result
+
+
+@app.post("/api/v1/ai/summarize", dependencies=[Depends(require_api_key)])
+def ai_summarize(request: Request, text: str = Form(...), max_sentences: int = Form(5)) -> dict:
+    """A plain-language summary of `text`, bounded to at most
+    `max_sentences` sentences (ai_intelligence.summarize)."""
+    _check_ai_available()
+    _check_rate_limit(request)
+    _check_ai_text_length(text)
+
+    request_id = uuid.uuid4().hex[:12]
+    audit.log_event(
+        "ai_summarize_requested",
+        request_id=request_id,
+        text_length=len(text),
+        max_sentences=max_sentences,
+        client_ip=_client_ip(request),
+        auth_enforced=bool(config.API_KEYS),
+    )
+    summary = _call_ai(
+        request_id, "ai_summarize", lambda: ai_intelligence.summarize(text, max_sentences)
+    )
+    audit.log_event("ai_summarize_completed", request_id=request_id, summary_length=len(summary))
+    return {"summary": summary}
+
+
+@app.post("/api/v1/ai/translate", dependencies=[Depends(require_api_key)])
+def ai_translate(request: Request, text: str = Form(...), target_language: str = Form(...)) -> dict:
+    """Translates `text` into `target_language` (ai_intelligence.translate)."""
+    _check_ai_available()
+    _check_rate_limit(request)
+    _check_ai_text_length(text)
+
+    request_id = uuid.uuid4().hex[:12]
+    audit.log_event(
+        "ai_translate_requested",
+        request_id=request_id,
+        text_length=len(text),
+        target_language=target_language,
+        client_ip=_client_ip(request),
+        auth_enforced=bool(config.API_KEYS),
+    )
+    translation = _call_ai(
+        request_id, "ai_translate", lambda: ai_intelligence.translate(text, target_language)
+    )
+    audit.log_event(
+        "ai_translate_completed", request_id=request_id, translation_length=len(translation)
+    )
+    return {"translation": translation}
+
+
+@app.post("/api/v1/ai/classify", dependencies=[Depends(require_api_key)])
+def ai_classify(
+    request: Request,
+    text: str | None = Form(None),
+    file: UploadFile | None = File(None),
+    page: int = Form(1),
+    categories: str | None = Form(None),
+) -> dict:
+    """
+    Intelligent classification: what kind of document this is, a real
+    semantic read (ai_intelligence.classify) -- unlike
+    document_analysis.py's own digital/scanned/mixed classification,
+    which never looks at what the document actually says. `categories`,
+    when given (comma-separated), constrains the answer to exactly one
+    of that list. Exactly one of `text`/`file` must be given.
+    """
+    _check_ai_available()
+    _check_rate_limit(request)
+
+    if (text is None) == (file is None):
+        raise HTTPException(status_code=400, detail="Provide exactly one of `text` or `file`.")
+
+    category_list = [c.strip() for c in categories.split(",") if c.strip()] if categories else None
+
+    request_id = uuid.uuid4().hex[:12]
+    image_bytes = None
+    if file is not None:
+        image_bytes = _read_ai_image(
+            request, file, page, request_id=request_id, event_prefix="ai_classify"
+        )
+    else:
+        _check_ai_text_length(text)
+
+    audit.log_event(
+        "ai_classify_requested",
+        request_id=request_id,
+        source="image" if image_bytes is not None else "text",
+        category_count=len(category_list) if category_list else 0,
+        client_ip=_client_ip(request),
+        auth_enforced=bool(config.API_KEYS),
+    )
+    result = _call_ai(
+        request_id,
+        "ai_classify",
+        lambda: ai_intelligence.classify(
+            text=text, image_bytes=image_bytes, categories=category_list
+        ),
+    )
+    audit.log_event("ai_classify_completed", request_id=request_id, category=result.get("category"))
+    return result
 
 
 @app.post("/api/v1/convert", dependencies=[Depends(require_api_key)])

@@ -23,3 +23,13 @@ psycopg[binary]==3.3.5
 # package to actually run a conversion, not just to talk to Redis.
 redis==8.1.0
 rq==2.12.0
+
+# Phase 16 (master directive numbering): AI Document Intelligence
+# (documents_converter/ai_intelligence.py) -- vision fallback,
+# structured extraction, summarization, translation, intelligent
+# classification. Google Gemini, not Anthropic -- see that module's
+# own docstring and config.py's GEMINI_API_KEY for why. Entirely
+# optional at runtime (config.is_ai_available() gates every endpoint
+# that uses it), but the package itself is a normal, always-installed
+# API dependency, same as redis/rq above.
+google-genai==2.23.0
