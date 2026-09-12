@@ -142,6 +142,20 @@ not this service's) maps to 502, distinct from this service's own 500.
 Google Gemini, not Anthropic/Claude, for a concrete, disclosed reason
 -- see ai_intelligence.py's and config.py's own docstrings.
 
+Phase 17 (master directive numbering) added POST /api/v1/account/signup,
+/login, /logout, GET/PUT /api/v1/account/preferences, GET
+/api/v1/account/usage, GET /api/v1/account/history, and POST
+/api/v1/jobs/{id}/save[/unsave] (documents_converter/api/accounts.py) --
+real accounts, separate from, and additive to, auth.py's existing
+pre-shared-key access control (see accounts.py's own docstring for
+exactly how those two are different concerns). Every account endpoint
+requires a valid session cookie (accounts.get_current_user, 401
+otherwise) and, for anything mutating, a matching X-CSRF-Token header
+(403 otherwise) -- POST /api/v1/jobs and /api/v1/batch instead use
+accounts.get_current_user_optional to *optionally* tag a new job/batch
+with whoever is logged in, never requiring it, so an unauthenticated or
+API-key-only caller keeps working exactly as before.
+
 Run locally:
     uvicorn documents_converter.api.app:app --reload
 """
@@ -172,7 +186,7 @@ from rq.job import Job as RQJob
 
 import fitz
 
-from . import audit, config, job_queue, security
+from . import accounts, audit, config, job_queue, security
 from .auth import require_api_key
 from .batch import Batch, BatchStore
 from .db import check_db_connection
@@ -214,6 +228,20 @@ def _check_startup_config() -> None:
             "[startup] WARNING: API_KEYS is not set -- every /api/v1/* route is "
             "unauthenticated. Fine for local development; set API_KEYS before "
             "exposing this service beyond a trusted network."
+        )
+    # Phase 17 (master directive numbering): unlike API_KEYS, an
+    # ephemeral SESSION_SECRET doesn't leave anything open-access -- a
+    # deployment that never uses accounts at all isn't affected -- so
+    # this is a warning, not a startup-refusing RuntimeError. See
+    # config.SESSION_SECRET's own docstring for exactly what breaks
+    # (every logged-in browser's CSRF token, not the session itself)
+    # when this process restarts without one explicitly set.
+    if config.ENVIRONMENT == "production" and not config.SESSION_SECRET_WAS_SET:
+        print(
+            "[startup] WARNING: SESSION_SECRET is not set -- using a random one generated "
+            "for this process only. Every already-logged-in browser will need to log in "
+            "again the next time this process restarts. Set SESSION_SECRET explicitly "
+            "before relying on accounts surviving a restart/redeploy."
         )
 
 
@@ -816,6 +844,123 @@ def ai_classify(
     return result
 
 
+# --------------------------------------------------------------------------
+# Phase 17 (master directive numbering): Authentication & User Workspace
+# --------------------------------------------------------------------------
+
+
+@app.post("/api/v1/account/signup", dependencies=[Depends(require_api_key)])
+def account_signup(request: Request, response: Response, credentials: dict) -> dict:
+    """
+    Creates a new account and immediately logs it in (same session
+    cookies POST .../login sets) -- one round trip for the common case
+    rather than forcing a separate login call right after signing up.
+    `credentials`: {"email": "...", "password": "..."}.
+    """
+    _check_rate_limit(request)
+    email, password = credentials.get("email"), credentials.get("password")
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="`email` and `password` are both required.")
+
+    try:
+        account = accounts.accounts.signup(email, password)
+    except (accounts.InvalidEmailError, accounts.WeakPasswordError) as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except accounts.EmailAlreadyRegisteredError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+    raw_token = accounts.accounts.create_session(account.id)
+    accounts.set_session_cookies(response, raw_token)
+    audit.log_event("account_signup", user_id=account.id, client_ip=_client_ip(request))
+    return {"id": account.id, "email": account.email}
+
+
+@app.post("/api/v1/account/login", dependencies=[Depends(require_api_key)])
+def account_login(request: Request, response: Response, credentials: dict) -> dict:
+    _check_rate_limit(request)
+    email, password = credentials.get("email"), credentials.get("password")
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="`email` and `password` are both required.")
+
+    try:
+        account = accounts.accounts.login(email, password)
+    except accounts.InvalidEmailError:
+        # Same 401 as a wrong password -- a malformed email shouldn't
+        # confirm anything different to the caller either.
+        raise HTTPException(status_code=401, detail="Incorrect email or password.") from None
+    except accounts.InvalidCredentialsError as e:
+        raise HTTPException(status_code=401, detail=str(e)) from e
+
+    raw_token = accounts.accounts.create_session(account.id)
+    accounts.set_session_cookies(response, raw_token)
+    audit.log_event("account_login", user_id=account.id, client_ip=_client_ip(request))
+    return {"id": account.id, "email": account.email}
+
+
+@app.post("/api/v1/account/logout", dependencies=[Depends(require_api_key)])
+def account_logout(
+    request: Request,
+    response: Response,
+    current_user: accounts.Account = Depends(accounts.get_current_user),
+) -> dict:
+    raw_token = request.cookies.get(accounts.SESSION_COOKIE_NAME)
+    if raw_token:
+        accounts.accounts.delete_session(raw_token)
+    accounts.clear_session_cookies(response)
+    audit.log_event("account_logout", user_id=current_user.id)
+    return {"logged_out": True}
+
+
+@app.get("/api/v1/account/me", dependencies=[Depends(require_api_key)])
+def account_me(current_user: accounts.Account = Depends(accounts.get_current_user)) -> dict:
+    return {"id": current_user.id, "email": current_user.email, "created_at": current_user.created_at}
+
+
+@app.get("/api/v1/account/preferences", dependencies=[Depends(require_api_key)])
+def get_account_preferences(current_user: accounts.Account = Depends(accounts.get_current_user)) -> dict:
+    return current_user.preferences
+
+
+@app.put("/api/v1/account/preferences", dependencies=[Depends(require_api_key)])
+def put_account_preferences(
+    preferences: dict, current_user: accounts.Account = Depends(accounts.get_current_user)
+) -> dict:
+    """Replaces the whole preferences object -- deliberately not a
+    partial merge, so a caller always knows exactly what's stored after
+    this call without needing to also GET it first."""
+    return accounts.accounts.set_preferences(current_user.id, preferences)
+
+
+@app.get("/api/v1/account/usage", dependencies=[Depends(require_api_key)])
+def get_account_usage(current_user: accounts.Account = Depends(accounts.get_current_user)) -> dict:
+    """Job counts only -- this project's core resource. Phase 16's AI
+    calls aren't tracked per-account yet (their own audit trail is
+    anonymous, predating accounts) -- a real, disclosed gap, not
+    silently ignored, and a natural extension for a later phase, not
+    this one."""
+    return _job_store.usage_for_user(current_user.id)
+
+
+@app.get("/api/v1/account/history", dependencies=[Depends(require_api_key)])
+def get_account_history(current_user: accounts.Account = Depends(accounts.get_current_user)) -> dict:
+    """A logged-in user's own past jobs, newest first -- both saved and
+    unsaved (see JobRecord.saved's own docstring: that flag only ever
+    affects retention, never visibility here)."""
+    jobs = _job_store.list_for_user(current_user.id)
+    return {
+        "jobs": [
+            {
+                "job_id": job.id,
+                "status": job.status,
+                "created_at": job.created_at,
+                "target": job.target,
+                "saved": job.saved,
+            }
+            for job in jobs
+        ]
+    }
+
+
 @app.post("/api/v1/convert", dependencies=[Depends(require_api_key)])
 def convert(request: Request, file: UploadFile, target: str = Form("xlsx")) -> Response:
     """
@@ -975,7 +1120,11 @@ def create_job(request: Request, file: UploadFile, target: str = Form("xlsx")) -
     """
     _check_rate_limit(request)
 
-    job = _job_store.create(target=target)
+    # Phase 17 (master directive numbering): tags this job with whoever
+    # is logged in, if anyone -- see accounts.get_current_user_optional's
+    # own docstring for why this never requires login or enforces CSRF.
+    current_user = accounts.get_current_user_optional(request)
+    job = _job_store.create(target=target, user_id=current_user.id if current_user else None)
     work_dir = storage.allocate(f"docconv-job-{job.id}-")
     job.work_dir = work_dir
     # Persisted immediately, not just set on this local `job` object --
@@ -1186,6 +1335,42 @@ def retry_job(job_id: str) -> dict:
     if outcome == "queue_unavailable":
         raise HTTPException(status_code=503, detail="Job queue is temporarily unavailable.")
     return {"job_id": job_id, "status": "queued"}
+
+
+def _set_job_saved(job_id: str, current_user: accounts.Account, saved: bool) -> dict:
+    """Shared by both endpoints below -- see JobRecord.saved's own
+    docstring (models.py) for why this is a per-job opt-in rather than
+    "every logged-in user's job lives forever", and
+    accounts.get_current_user_optional's docstring (used at job
+    creation) for why an anonymous job (user_id is None) has no owner
+    to check against here."""
+    job = _job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job.user_id != current_user.id:
+        # Same status for "belongs to someone else" and "was never tied
+        # to any account" -- neither should confirm to the caller
+        # whether a job id they don't own even exists.
+        raise HTTPException(status_code=403, detail="This job doesn't belong to your account.")
+    updated = _job_store.set_saved(job_id, saved)
+    return {"job_id": job_id, "saved": updated.saved}
+
+
+@app.post("/api/v1/jobs/{job_id}/save", dependencies=[Depends(require_api_key)])
+def save_job(job_id: str, current_user: accounts.Account = Depends(accounts.get_current_user)) -> dict:
+    """Phase 17 (master directive numbering): exempts this one job from
+    JobStore's normal retention-window cleanup. Requires a logged-in
+    session and ownership of the job (403 for someone else's, or an
+    anonymous one)."""
+    return _set_job_saved(job_id, current_user, True)
+
+
+@app.post("/api/v1/jobs/{job_id}/unsave", dependencies=[Depends(require_api_key)])
+def unsave_job(job_id: str, current_user: accounts.Account = Depends(accounts.get_current_user)) -> dict:
+    """Reverses POST .../save -- the job goes back to the normal
+    retention-window cleanup once it next qualifies (terminal status,
+    past JOB_RETENTION_SECONDS)."""
+    return _set_job_saved(job_id, current_user, False)
 
 
 @app.get("/api/v1/jobs/{job_id}/events", dependencies=[Depends(require_api_key)])
@@ -1421,9 +1606,13 @@ def create_batch(request: Request, files: list[UploadFile] = File(...), target: 
     if not files:
         raise HTTPException(status_code=400, detail="Batch needs at least 1 file.")
 
+    # Phase 17 (master directive numbering): see create_job's identical note.
+    current_user = accounts.get_current_user_optional(request)
+    owner_id = current_user.id if current_user else None
+
     job_ids = []
     for file in files:
-        job = _job_store.create(target=target)
+        job = _job_store.create(target=target, user_id=owner_id)
         work_dir = storage.allocate(f"docconv-job-{job.id}-")
         job.work_dir = work_dir
         _job_store.update(job.id, work_dir=work_dir)  # see create_job's identical note
@@ -1470,7 +1659,7 @@ def create_batch(request: Request, files: list[UploadFile] = File(...), target: 
             # validation failure above.
             continue
 
-    batch = _batch_store.create(target, job_ids)
+    batch = _batch_store.create(target, job_ids, user_id=owner_id)
     audit.log_event(
         "batch_created",
         batch_id=batch.id,

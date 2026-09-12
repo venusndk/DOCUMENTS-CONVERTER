@@ -300,3 +300,68 @@ def test_frontend_image_to_pdf_end_to_end(running_app_server, tmp_path):
         assert doc[0].rect.height == 80
     finally:
         doc.close()
+
+
+@requires_redis
+def test_frontend_signup_submit_job_and_save_it(running_app_server, tmp_path):
+    """
+    Phase 17 (master directive numbering): a real browser signs up
+    through the actual account UI, submits a real job while logged in,
+    opens History, and saves it -- end to end through the real page's
+    own JavaScript (including reading the CSRF cookie and echoing it
+    back, accounts.py's own docstring), not a direct API call. Uses
+    image->pdf (no Tesseract needed), same reasoning as
+    test_frontend_image_to_pdf_end_to_end above -- this test's only
+    real dependency should be Redis, not also Tesseract.
+    """
+    import uuid
+
+    from playwright.sync_api import sync_playwright
+    from PIL import Image
+
+    png_path = tmp_path / "photo.png"
+    Image.new("RGB", (100, 80), color=(50, 120, 200)).save(png_path)
+    email = f"frontend-{uuid.uuid4().hex}@example.com"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(running_app_server + "/")
+
+            page.click("#account-toggle-link")
+            page.click("#auth-mode-toggle")  # switch from Log in to Sign up
+            page.fill("#auth-email", email)
+            page.fill("#auth-password", "a real password 123")
+            page.click("#auth-submit-btn")
+            page.wait_for_function(
+                "document.getElementById('account-status').textContent.includes('Signed in')",
+                timeout=10_000,
+            )
+
+            page.set_input_files("#file-input", str(png_path))
+            page.wait_for_function(
+                "document.getElementById('target-select').options.length > 0", timeout=10_000
+            )
+            page.select_option("#target-select", "pdf")
+
+            with page.expect_download(timeout=30_000):
+                page.click("#submit-btn")
+
+            page.click("#history-toggle-link")
+            page.wait_for_selector(".history-row", timeout=10_000)
+            assert page.locator(".history-row").count() >= 1
+
+            save_btn = page.locator(".history-row button").first
+            assert save_btn.inner_text() == "Save"
+            save_btn.click()
+            # Optional chaining, not a bare property read -- toggleSaved()
+            # re-renders the whole list (historyListEl.innerHTML = "" then
+            # rebuilds it), so a poll landing in that brief empty window
+            # would otherwise throw on a null querySelector result instead
+            # of just evaluating falsy and being polled past.
+            page.wait_for_function(
+                "document.querySelector('.history-row button')?.innerText === 'Unsave'", timeout=10_000
+            )
+        finally:
+            browser.close()

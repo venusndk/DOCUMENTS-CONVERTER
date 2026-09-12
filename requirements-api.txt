@@ -33,3 +33,11 @@ rq==2.12.0
 # that uses it), but the package itself is a normal, always-installed
 # API dependency, same as redis/rq above.
 google-genai==2.23.0
+
+# Phase 17 (master directive numbering): Authentication & User
+# Workspace (documents_converter/api/accounts.py) -- real accounts,
+# server-side session cookies, history, preferences, usage, saved jobs.
+# argon2-cffi for password hashing: argon2id is OWASP's current first
+# recommendation for new password storage, ahead of bcrypt -- not a
+# holdover choice, picked directly for this phase.
+argon2-cffi==25.1.0

@@ -74,6 +74,17 @@ services:
       # value. Set it on the host shell before `docker compose up`:
       #   GEMINI_API_KEY=... docker compose up --build
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # Phase 17 (master directive numbering): Authentication & User
+      # Workspace. Same shape as GEMINI_API_KEY above -- an unset-on-
+      # host `${VAR:-}` is safe here too, since config.py's
+      # SESSION_SECRET falls back to a real (if ephemeral) random value
+      # for an empty string, the same `or` pattern as GEMINI_API_KEY,
+      # not the no-fallback pattern AI_MODEL/AI_MAX_TEXT_CHARS have.
+      # Left unset, every restart of this container invalidates every
+      # already-logged-in browser's CSRF token (see that config value's
+      # own docstring) -- set it explicitly for anything past local/dev use:
+      #   SESSION_SECRET=... docker compose up --build
+      SESSION_SECRET: ${SESSION_SECRET:-}
     volumes:
       - work_data:/app/work
     ports:
