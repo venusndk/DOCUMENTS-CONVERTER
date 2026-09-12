@@ -149,6 +149,18 @@ def test_frontend_review_lets_a_person_correct_a_cell_before_downloading(
                 timeout=60_000,
             )
 
+            # Phase 15 (master directive numbering): the source page
+            # image should actually render alongside the editable table,
+            # not just exist as an unused endpoint -- confirmed via a
+            # real browser, not just that the img tag was created.
+            page.wait_for_selector(".review-page-image", timeout=10_000)
+            preview_src = page.locator(".review-page-image").first.get_attribute("src")
+            assert preview_src and preview_src.startswith("blob:")
+            preview_natural_width = page.locator(".review-page-image").first.evaluate(
+                "el => el.naturalWidth"
+            )
+            assert preview_natural_width > 0, "page preview image failed to actually load"
+
             first_cell = page.locator(".review-table td").first
             assert first_cell.inner_text() == "S/N"
             first_cell.click()

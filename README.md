@@ -738,6 +738,47 @@ curl.exe -X POST http://127.0.0.1:8000/api/v1/jobs/a1b2c3.../review `
   -d '[{"sheet_name": "Page 1 - Table 1", "row_index": 0, "col_index": 0, "value": "Corrected"}]'
 ```
 
+### Document Preview & Human Review (Phase 15 completion, master directive numbering)
+
+Phase 7 built editable extracted tables and suspicious-cell review, but
+never gave a reviewer any actual picture of the page a flagged cell
+came from — just the extracted values in isolation. Phase 15 adds
+exactly that, plus a job-independent "what would this look like"
+preview for a document nobody has committed to converting yet
+(`documents_converter/document_preview.py`).
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/preview` | Given a file and a 1-indexed `page` (default 1): that page's rendered image, a bounded text preview (native text or real OCR), and the total page count — no job/queue involved |
+| `GET /api/v1/jobs/{id}/preview/pages/{page_number}` | Renders one page of a job's *original* uploaded file as a PNG |
+
+`POST /api/v1/preview` covers PDF preview, OCR preview, and extracted
+text preview together — real Tesseract OCR when a page has no native
+text layer, the native layer directly when it does, always OCR for a
+plain image upload. Deliberately does **not** attempt a table preview
+of its own: full table detection (img2table) is real, non-trivial work,
+and running it twice — once for a quick look, again for the real job —
+would waste exactly the compute the async job/queue pipeline exists to
+spare a caller from paying synchronously. Table preview is served by
+the job-based path instead, once a real job has already done the real
+detection.
+
+`GET /api/v1/jobs/{id}/preview/pages/{page_number}` is what completes
+Phase 7's review UI: every review-JSON table's `sheet_name` already
+encodes its 1-indexed source page (`"Page N - Table M"`), so the
+frontend pairs each table with this endpoint's image for that same N —
+no new field needed on the review JSON itself. The web page now shows
+that source image directly above each table's editable rows, so
+checking a cell flagged ⚠ means looking at the real page, not guessing
+from context. Verified with a real browser (Playwright): confirmed the
+image element actually loads (`naturalWidth > 0`), not just that the
+`<img>` tag exists in the DOM.
+
+```powershell
+curl.exe -F "file=@scan.pdf" -F "page=2" http://127.0.0.1:8000/api/v1/preview
+curl.exe http://127.0.0.1:8000/api/v1/jobs/a1b2c3.../preview/pages/2 -o page2.png
+```
+
 ## HTTP API (optional)
 
 An API wraps the registry above, for anything that needs to call this over
