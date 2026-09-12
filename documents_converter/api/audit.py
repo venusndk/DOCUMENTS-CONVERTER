@@ -22,6 +22,16 @@ Emits one JSON object per line to a dedicated logger
 deployment already has), and additionally to config.AUDIT_LOG_PATH if
 that's set, for a deployment that wants a durable file on a mounted
 volume without standing up a database just for this.
+
+Phase 18 (master directive numbering) added a third destination: a
+real database row (AuditLogRecord, models.py), so GET
+/api/v1/admin/audit-log can actually show this history back through
+the API instead of only ever living in stdout/an optional file no
+running process can query. Best-effort and never fatal: a DB write
+failure here is caught and swallowed (loudly printed, not silently
+dropped) rather than ever breaking the real feature the event
+describes -- logging that a conversion happened must never be able to
+make the conversion itself fail.
 """
 
 from __future__ import annotations
@@ -71,7 +81,10 @@ _configure_handlers()
 
 def log_event(event: str, **fields: Any) -> None:
     """
-    Writes one audit record as a single JSON-line log entry.
+    Writes one audit record as a single JSON-line log entry (stdout,
+    plus config.AUDIT_LOG_PATH if set), and, best-effort, one row to
+    the database (Phase 18, master directive numbering -- see module
+    docstring).
 
     :param event: one of "convert_requested", "convert_completed",
         "convert_failed", "job_created", "job_completed", "job_failed".
@@ -79,5 +92,32 @@ def log_event(event: str, **fields: Any) -> None:
         status, ids, client IP. Never document content, the
         client-supplied filename, or anything read from inside the file.
     """
-    record = {"ts": time.time(), "event": event, **fields}
+    ts = time.time()
+    record = {"ts": ts, "event": event, **fields}
     _logger.info(json.dumps(record, default=str))
+    _persist_event(ts, event, fields)
+
+
+def _persist_event(ts: float, event: str, fields: dict) -> None:
+    # Imported here, not at module level -- avoids paying for a database
+    # engine/connection setup (db.py's module-level `engine =
+    # _make_engine(...)`) for every single importer of this module,
+    # including one that logs events but never otherwise touches the
+    # database. Cheap enough per call (Python caches the import) that
+    # this isn't a real performance concern for how often log_event()
+    # actually runs.
+    try:
+        from .db import SessionLocal
+        from .models import AuditLogRecord
+
+        with SessionLocal() as session:
+            session.add(
+                AuditLogRecord(ts=ts, event=event, fields_json=json.dumps(fields, default=str))
+            )
+            session.commit()
+    except Exception as e:
+        # Never lets a database hiccup break the real feature the event
+        # describes -- see module docstring. Printed, not silently
+        # dropped, so a genuinely broken audit-log persistence path is
+        # still visible to whoever operates this service.
+        print(f"[audit] failed to persist event {event!r} to the database: {e!r}")

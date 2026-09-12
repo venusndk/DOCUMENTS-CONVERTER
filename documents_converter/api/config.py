@@ -207,3 +207,16 @@ SESSION_SECRET_WAS_SET: bool = bool(os.environ.get("SESSION_SECRET"))
 # enough that a stolen/forgotten session cookie doesn't stay valid
 # indefinitely.
 SESSION_MAX_AGE_SECONDS: float = float(os.environ.get("SESSION_MAX_AGE_SECONDS", str(14 * 24 * 3600)))
+
+# Phase 18 (master directive numbering): Administration & Observability.
+# Same shape as API_KEYS above (comma-separated, empty by default) --
+# not a new, separate admin-auth mechanism, an extension of Phase 17's
+# real accounts (User.is_admin): an account whose email is in this list
+# is promoted to admin at signup/login (accounts.py), demoted the same
+# way if later removed from it. Empty by default, so a fresh checkout
+# has no admin account and every /api/v1/admin/* route stays
+# unreachable (403) until this is explicitly configured -- the same
+# "not a silent bypass" reasoning API_KEYS was built on.
+ADMIN_EMAILS: tuple[str, ...] = tuple(
+    e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()
+)

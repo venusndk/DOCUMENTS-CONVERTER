@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-from fastapi import HTTPException, Request, Response
+from fastapi import Depends, HTTPException, Request, Response
 
 from . import config
 from .db import SessionLocal
@@ -111,6 +111,9 @@ class Account:
     email: str
     created_at: float
     preferences: dict = field(default_factory=dict)
+    # Phase 18 (master directive numbering): Administration &
+    # Observability. See User.is_admin's own docstring (models.py).
+    is_admin: bool = False
 
     @classmethod
     def _from_record(cls, record: User) -> Account:
@@ -119,7 +122,11 @@ class Account:
         except (json.JSONDecodeError, TypeError):
             preferences = {}
         return cls(
-            id=record.id, email=record.email, created_at=record.created_at, preferences=preferences
+            id=record.id,
+            email=record.email,
+            created_at=record.created_at,
+            preferences=preferences,
+            is_admin=record.is_admin,
         )
 
 
@@ -141,6 +148,7 @@ class AccountStore:
                 password_hash=_hasher.hash(password),
                 created_at=time.time(),
                 preferences_json="{}",
+                is_admin=email in config.ADMIN_EMAILS,
             )
             session.add(record)
             session.commit()
@@ -168,6 +176,24 @@ class AccountStore:
                 # verifies for a real password) -- kept as a
                 # defense-in-depth guard, not the real rejection path.
                 raise InvalidCredentialsError("Incorrect email or password.")
+
+            # Phase 18 (master directive numbering): re-synced on every
+            # real login, not just at signup -- an account created
+            # before its email was added to ADMIN_EMAILS is promoted the
+            # next time it logs in, and one removed from that list is
+            # correspondingly demoted. A real, disclosed limitation:
+            # this only re-derives is_admin from ADMIN_EMAILS at login,
+            # not on every request -- get_account_for_session (used by
+            # every request) does re-read the User row fresh each time,
+            # so a demotion applied here takes effect immediately for
+            # that account's *other*, already-open sessions too, but an
+            # admin removed from ADMIN_EMAILS while never logging out
+            # keeps admin access until they log in again (nothing forces
+            # a re-sync purely from the passage of time).
+            should_be_admin = email in config.ADMIN_EMAILS
+            if record.is_admin != should_be_admin:
+                record.is_admin = should_be_admin
+                session.commit()
             return Account._from_record(record)
 
     def get_account(self, user_id: str) -> Account | None:
@@ -308,6 +334,19 @@ def get_current_user(request: Request) -> Account:
             raise HTTPException(status_code=403, detail="Missing or invalid CSRF token.")
 
     return account
+
+
+def get_current_admin(current_user: Account = Depends(get_current_user)) -> Account:
+    """
+    Required-admin dependency for every /api/v1/admin/* route -- an
+    ordinary valid session (get_current_user's own 401/403 checks
+    apply first), plus User.is_admin. 403, not 404, for a non-admin
+    caller: whether these routes exist at all isn't a secret worth
+    hiding, only what they return is.
+    """
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return current_user
 
 
 def get_current_user_optional(request: Request) -> Account | None:

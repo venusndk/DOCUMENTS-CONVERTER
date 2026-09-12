@@ -36,6 +36,13 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     preferences_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    # Phase 18 (master directive numbering): Administration &
+    # Observability. Not a separate admin-account system -- an ordinary
+    # account, promoted/demoted at signup/login time by whether its
+    # email is currently in config.ADMIN_EMAILS (accounts.py). Every
+    # /api/v1/admin/* route requires this, on top of an ordinary valid
+    # session (accounts.get_current_admin).
+    is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class UserSession(Base):
@@ -134,3 +141,34 @@ class JobRecord(Base):
     # jobs (user_id is None) can't be saved -- there's no account to list
     # them under later, so saving one would be a no-op nobody could ever see.
     saved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class AuditLogRecord(Base):
+    """
+    Phase 18 (master directive numbering): Administration &
+    Observability. audit.py's structured events (Phase 11) have always
+    gone to stdout, and optionally a file -- real for a log aggregator
+    to pick up, but never something this service's own API could show
+    back to an admin. This table is that: every audit.log_event() call
+    also writes one row here (best-effort -- see audit.py's own
+    docstring for why a DB hiccup must never break the real feature the
+    event describes), queried by GET /api/v1/admin/audit-log.
+
+    `fields_json` is one column, not one per possible field, for the
+    same reason User.preferences_json and BatchRecord.job_ids are:
+    log_event()'s own contract is "safe metadata only, whatever shape a
+    given event needs" -- a fixed schema here would mean a new migration
+    for every new event type this project's own code already adds
+    freely today.
+
+    No automatic retention/pruning yet -- a real, disclosed limitation
+    for a deployment running long enough that this table's growth
+    matters (see README); not addressed in this phase.
+    """
+
+    __tablename__ = "audit_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts: Mapped[float] = mapped_column(Float, nullable=False)
+    event: Mapped[str] = mapped_column(String(64), nullable=False)
+    fields_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")

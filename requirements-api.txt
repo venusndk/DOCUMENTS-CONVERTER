@@ -41,3 +41,10 @@ google-genai==2.23.0
 # recommendation for new password storage, ahead of bcrypt -- not a
 # holdover choice, picked directly for this phase.
 argon2-cffi==25.1.0
+
+# Phase 18 (master directive numbering): Administration & Observability
+# (documents_converter/api/admin.py) -- GET /metrics in real Prometheus
+# text exposition format, a genuine choice over a custom JSON metrics
+# endpoint (see README): plugs directly into real production monitoring
+# (Prometheus, Grafana) with zero extra glue code.
+prometheus-client==0.26.0
