@@ -156,6 +156,24 @@ accounts.get_current_user_optional to *optionally* tag a new job/batch
 with whoever is logged in, never requiring it, so an unauthenticated or
 API-key-only caller keeps working exactly as before.
 
+Phase 18 (master directive numbering) added GET /admin (a real
+dashboard page), GET /metrics (Prometheus text exposition format,
+scraped continuously -- prometheus_client, updated by this module's own
+_metrics_middleware plus admin.py's runtime Gauges), and GET
+/api/v1/admin/queue, /providers, /analytics, /audit-log
+(documents_converter/api/admin.py) -- not a new, separate admin-auth
+mechanism, an extension of Phase 17's real accounts
+(accounts.get_current_admin: an ordinary valid session, plus
+User.is_admin, itself synced from config.ADMIN_EMAILS at signup/login).
+GET /health stayed a fast, minimal liveness probe (Tesseract + the
+database only) rather than growing every provider check Phase 18 added
+-- GET /api/v1/admin/providers is the fuller picture, for a dashboard,
+not a load balancer. audit.py (Phase 11) also gained a third
+destination for every event it logs: a real database row
+(AuditLogRecord), so GET /api/v1/admin/audit-log can show this
+project's own audit trail back through the API instead of that history
+only ever living in stdout/an optional file.
+
 Run locally:
     uvicorn documents_converter.api.app:app --reload
 """
@@ -186,7 +204,7 @@ from rq.job import Job as RQJob
 
 import fitz
 
-from . import accounts, audit, config, job_queue, security
+from . import accounts, admin, audit, config, job_queue, security
 from .auth import require_api_key
 from .batch import Batch, BatchStore
 from .db import check_db_connection
@@ -254,6 +272,34 @@ async def _lifespan(_app: FastAPI):
 
 app = FastAPI(title="Documents Converter API", version="0.1.0", lifespan=_lifespan)
 
+
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):
+    """
+    Phase 18 (master directive numbering): updates
+    admin.HTTP_REQUESTS_TOTAL/HTTP_REQUEST_DURATION_SECONDS on every
+    request -- the real, continuously-updated half of "metrics" (GET
+    /metrics), distinct from admin.job_analytics()'s on-demand
+    snapshot. Reads the matched route's own path *template* off
+    `request.scope["route"]` after routing has happened (call_next
+    already ran it), not `request.url.path` -- a raw path would put a
+    fresh, unbounded label value in Prometheus for every distinct job
+    id ever requested (GET /api/v1/jobs/{job_id} et al.), a real,
+    well-known cardinality blowup this avoids by construction.
+    """
+    start = time.monotonic()
+    response = await call_next(request)
+    route = request.scope.get("route")
+    path_label = getattr(route, "path", request.url.path)
+    admin.HTTP_REQUESTS_TOTAL.labels(
+        method=request.method, path=path_label, status=response.status_code
+    ).inc()
+    admin.HTTP_REQUEST_DURATION_SECONDS.labels(method=request.method, path=path_label).observe(
+        time.monotonic() - start
+    )
+    return response
+
+
 _rate_limiter = FixedWindowRateLimiter(
     max_requests=config.RATE_LIMIT_MAX_REQUESTS,
     window_seconds=config.RATE_LIMIT_WINDOW_SECONDS,
@@ -286,6 +332,22 @@ def index() -> str:
     return (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
 
+@app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
+def admin_page() -> str:
+    """
+    Phase 18 (master directive numbering): the admin dashboard page.
+    Served to anyone who requests it -- exactly like GET / -- because
+    the real access control lives server-side, per request, on the API
+    calls this page's own JS makes (accounts.get_current_admin: 401 if
+    not logged in at all, 403 if logged in but not an admin), the same
+    principle GET /api/v1/jobs/{id} already relies on rather than
+    trying to keep a URL secret. A non-admin visiting this page sees
+    exactly that -- a clear "admin access required" message, not a
+    blank or broken page.
+    """
+    return (_STATIC_DIR / "admin.html").read_text(encoding="utf-8")
+
+
 @app.get("/health")
 def health() -> dict:
     """
@@ -301,6 +363,52 @@ def health() -> dict:
         "tesseract_available": check_tesseract_available(config.TESSERACT_CMD),
         "database_available": check_db_connection(),
     }
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics() -> Response:
+    """
+    Phase 18 (master directive numbering): real Prometheus text
+    exposition format (admin.render_metrics -- prometheus_client's own
+    generate_latest), not a custom JSON shape -- plugs directly into
+    real monitoring tooling (Prometheus, Grafana) with zero glue code.
+    Unauthenticated, like GET /health and for the same stated reason
+    (module docstring, Phase 6): a monitoring scraper needs to reach
+    this without credentials, and network-level access control is the
+    conventional way this endpoint is protected in real deployments,
+    not an API key a scrape config would need to carry.
+    """
+    body, content_type = admin.render_metrics()
+    return Response(content=body, media_type=content_type)
+
+
+# --------------------------------------------------------------------------
+# Phase 18 (master directive numbering): Administration & Observability
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/v1/admin/queue", dependencies=[Depends(require_api_key)])
+def admin_queue_status(_admin: accounts.Account = Depends(accounts.get_current_admin)) -> dict:
+    return admin.queue_status()
+
+
+@app.get("/api/v1/admin/providers", dependencies=[Depends(require_api_key)])
+def admin_provider_status(_admin: accounts.Account = Depends(accounts.get_current_admin)) -> dict:
+    return admin.provider_status()
+
+
+@app.get("/api/v1/admin/analytics", dependencies=[Depends(require_api_key)])
+def admin_job_analytics(_admin: accounts.Account = Depends(accounts.get_current_admin)) -> dict:
+    return admin.job_analytics()
+
+
+@app.get("/api/v1/admin/audit-log", dependencies=[Depends(require_api_key)])
+def admin_audit_log(
+    limit: int = 100,
+    event: str | None = None,
+    _admin: accounts.Account = Depends(accounts.get_current_admin),
+) -> dict:
+    return {"events": admin.query_audit_log(limit=limit, event=event)}
 
 
 @app.get("/api/v1/capabilities")
@@ -913,7 +1021,16 @@ def account_logout(
 
 @app.get("/api/v1/account/me", dependencies=[Depends(require_api_key)])
 def account_me(current_user: accounts.Account = Depends(accounts.get_current_user)) -> dict:
-    return {"id": current_user.id, "email": current_user.email, "created_at": current_user.created_at}
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "created_at": current_user.created_at,
+        # Phase 18 (master directive numbering): lets the admin
+        # dashboard (GET /admin) tell "not an admin" from "not logged
+        # in at all" without needing to attempt an admin-only call
+        # first just to read its status code.
+        "is_admin": current_user.is_admin,
+    }
 
 
 @app.get("/api/v1/account/preferences", dependencies=[Depends(require_api_key)])

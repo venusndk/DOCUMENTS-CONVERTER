@@ -365,3 +365,104 @@ def test_frontend_signup_submit_job_and_save_it(running_app_server, tmp_path):
             )
         finally:
             browser.close()
+
+
+def test_admin_page_gates_a_non_admin_account(running_app_server):
+    """Phase 18 (master directive numbering): a real browser signs up
+    an ordinary (non-admin) account and visits /admin -- the page loads
+    (it's not a secret URL, see admin_page's own docstring) but shows a
+    clear gate message instead of dashboard data."""
+    import uuid
+
+    from playwright.sync_api import sync_playwright
+
+    email = f"notadmin-{uuid.uuid4().hex}@example.com"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(running_app_server + "/")
+            page.click("#account-toggle-link")
+            page.click("#auth-mode-toggle")
+            page.fill("#auth-email", email)
+            page.fill("#auth-password", "a real password 123")
+            page.click("#auth-submit-btn")
+            page.wait_for_function(
+                "document.getElementById('account-status').textContent.includes('Signed in')",
+                timeout=10_000,
+            )
+
+            page.goto(running_app_server + "/admin")
+            page.wait_for_function(
+                "document.getElementById('gate-message').style.display === 'block'", timeout=10_000
+            )
+            assert "isn't an admin" in page.locator("#gate-message").inner_text()
+            assert page.locator("#dashboard").is_hidden()
+        finally:
+            browser.close()
+
+
+@requires_redis
+def test_admin_page_shows_real_dashboard_data_for_an_admin(running_app_server, monkeypatch, tmp_path):
+    """
+    Phase 18 (master directive numbering): a real browser signs up an
+    account whose email is in ADMIN_EMAILS (monkeypatched directly on
+    the live config module -- the background uvicorn server in
+    running_app_server runs in this same process, so this takes effect
+    immediately, no restart needed), submits a real job first so
+    there's real data to show, then confirms /admin's own JS actually
+    renders real numbers from the real API -- not just that the page
+    loads.
+    """
+    import uuid
+
+    from playwright.sync_api import sync_playwright
+    from PIL import Image
+
+    from documents_converter.api import config
+
+    email = f"admin-{uuid.uuid4().hex}@example.com"
+    monkeypatch.setattr(config, "ADMIN_EMAILS", (email,))
+
+    png_path = tmp_path / "photo.png"
+    Image.new("RGB", (90, 70), color=(20, 150, 90)).save(png_path)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(running_app_server + "/")
+            page.click("#account-toggle-link")
+            page.click("#auth-mode-toggle")
+            page.fill("#auth-email", email)
+            page.fill("#auth-password", "a real password 123")
+            page.click("#auth-submit-btn")
+            page.wait_for_function(
+                "document.getElementById('account-status').textContent.includes('Signed in')",
+                timeout=10_000,
+            )
+
+            page.set_input_files("#file-input", str(png_path))
+            page.wait_for_function(
+                "document.getElementById('target-select').options.length > 0", timeout=10_000
+            )
+            page.select_option("#target-select", "pdf")
+            with page.expect_download(timeout=30_000):
+                page.click("#submit-btn")
+
+            page.goto(running_app_server + "/admin")
+            page.wait_for_function(
+                "document.getElementById('dashboard').style.display === 'block'", timeout=10_000
+            )
+            page.wait_for_function(
+                "document.getElementById('queue-content').textContent.includes('Queued')",
+                timeout=10_000,
+            )
+            assert "Total jobs" in page.locator("#analytics-content").inner_text()
+            assert "Tesseract" in page.locator("#providers-content").inner_text()
+            page.wait_for_function(
+                "document.getElementById('audit-log-body').children.length > 0", timeout=10_000
+            )
+        finally:
+            browser.close()

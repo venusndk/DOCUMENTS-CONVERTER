@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin Dashboard</title>
+<style>
+  /* Same design tokens as index.html -- one visual language across
+     both pages, not a second, disconnected theme. */
+  :root {
+    --bg: #f7f7f9;
+    --card: #ffffff;
+    --ink: #1a1a2e;
+    --muted: #6b7280;
+    --accent: #4f46e5;
+    --border: #e5e7eb;
+
+    --status-success: #22C55E;
+    --status-processing: #F59E0B;
+    --status-error: #EF4444;
+    --status-neutral: #64748B;
+
+    --status-success-surface: #ECFDF5;
+    --status-success-text: #15803D;
+    --status-processing-surface: #FFFBEB;
+    --status-processing-text: #B45309;
+    --status-error-surface: #FEF2F2;
+    --status-error-text: #B91C1C;
+    --status-neutral-surface: #F1F5F9;
+    --status-neutral-text: #475569;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --card: #181b21;
+      --ink: #e5e7eb;
+      --muted: #9aa1ac;
+      --border: #2a2e37;
+
+      --status-success-surface: rgba(34, 197, 94, 0.14);
+      --status-success-text: #4ADE80;
+      --status-processing-surface: rgba(245, 158, 11, 0.16);
+      --status-processing-text: #FBBF24;
+      --status-error-surface: rgba(239, 68, 68, 0.16);
+      --status-error-text: #F87171;
+      --status-neutral-surface: rgba(100, 116, 139, 0.18);
+      --status-neutral-text: #B0B8C4;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    padding: 32px 16px;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); font-size: 0.9rem; margin: 0 0 24px; }
+  a { color: var(--accent); }
+
+  #gate-message {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 32px;
+    text-align: center;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+  .panel {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+  }
+  .panel h2 { font-size: 0.95rem; margin: 0 0 14px; }
+  .kv { display: flex; justify-content: space-between; padding: 5px 0; font-size: 0.85rem; }
+  .kv .k { color: var(--muted); }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+  .badge.ok { background: var(--status-success-surface); color: var(--status-success-text); }
+  .badge.down { background: var(--status-error-surface); color: var(--status-error-text); }
+
+  table { border-collapse: collapse; width: 100%; font-size: 0.8rem; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; }
+
+  #audit-panel { grid-column: 1 / -1; }
+  #audit-log-wrapper { max-height: 360px; overflow-y: auto; }
+  .refresh-note { font-size: 0.75rem; color: var(--muted); margin-top: 24px; text-align: center; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Admin Dashboard</h1>
+    <p class="subtitle">Queue, providers, job analytics, and the audit log (Phase 18, master directive numbering).</p>
+
+    <div id="gate-message" style="display:none;"></div>
+    <div id="dashboard" style="display:none;">
+      <div class="grid">
+        <div class="panel" id="queue-panel">
+          <h2>Job queue</h2>
+          <div id="queue-content">Loading…</div>
+        </div>
+        <div class="panel" id="providers-panel">
+          <h2>Providers</h2>
+          <div id="providers-content">Loading…</div>
+        </div>
+        <div class="panel" id="analytics-panel">
+          <h2>Job analytics</h2>
+          <div id="analytics-content">Loading…</div>
+        </div>
+      </div>
+      <div class="grid">
+        <div class="panel" id="audit-panel">
+          <h2>Recent audit events</h2>
+          <div id="audit-log-wrapper">
+            <table>
+              <thead><tr><th>Time</th><th>Event</th><th>Details</th></tr></thead>
+              <tbody id="audit-log-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <p class="refresh-note">Refreshes automatically every 15 seconds.</p>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const gateMessage = document.getElementById("gate-message");
+  const dashboard = document.getElementById("dashboard");
+  const queueContent = document.getElementById("queue-content");
+  const providersContent = document.getElementById("providers-content");
+  const analyticsContent = document.getElementById("analytics-content");
+  const auditLogBody = document.getElementById("audit-log-body");
+
+  function badge(ok) {
+    return `<span class="badge ${ok ? "ok" : "down"}">${ok ? "OK" : "DOWN"}</span>`;
+  }
+
+  function kvRow(key, value) {
+    return `<div class="kv"><span class="k">${key}</span><span>${value}</span></div>`;
+  }
+
+  async function fetchJson(url) {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`${url} -> HTTP ${resp.status}`);
+    return resp.json();
+  }
+
+  async function renderQueue() {
+    try {
+      const q = await fetchJson("/api/v1/admin/queue");
+      if (!q.available) {
+        queueContent.innerHTML = `${badge(false)} <span style="margin-left:8px;">${q.error || "Redis unreachable"}</span>`;
+        return;
+      }
+      let html = "";
+      html += kvRow("Queued", q.queued);
+      html += kvRow("Started", q.started);
+      html += kvRow("Failed", q.failed);
+      html += kvRow("Scheduled", q.scheduled);
+      html += kvRow("Finished", q.finished);
+      html += kvRow("Workers", q.workers.length);
+      for (const w of q.workers) {
+        html += kvRow(`&nbsp;&nbsp;${w.name}`, `${w.state} (${w.successful_job_count} ok, ${w.failed_job_count} failed)`);
+      }
+      queueContent.innerHTML = html;
+    } catch (err) {
+      queueContent.textContent = err.message;
+    }
+  }
+
+  async function renderProviders() {
+    try {
+      const p = await fetchJson("/api/v1/admin/providers");
+      let html = "";
+      html += kvRow("Tesseract", badge(p.tesseract));
+      html += kvRow("LibreOffice", badge(p.libreoffice));
+      html += kvRow("Redis", badge(p.redis));
+      html += kvRow("Database", badge(p.database));
+      html += kvRow("Gemini (AI) configured", badge(p.ai_gemini_configured));
+      providersContent.innerHTML = html;
+    } catch (err) {
+      providersContent.textContent = err.message;
+    }
+  }
+
+  async function renderAnalytics() {
+    try {
+      const a = await fetchJson("/api/v1/admin/analytics");
+      let html = "";
+      html += kvRow("Total jobs", a.total_jobs);
+      for (const [status, count] of Object.entries(a.jobs_by_status)) {
+        html += kvRow(`&nbsp;&nbsp;${status}`, count);
+      }
+      html += kvRow("Success rate", a.success_rate === null ? "—" : `${(a.success_rate * 100).toFixed(1)}%`);
+      html += kvRow(
+        "Avg. duration",
+        a.average_duration_ms === null ? "—" : `${(a.average_duration_ms / 1000).toFixed(1)}s (n=${a.duration_sample_size})`
+      );
+      analyticsContent.innerHTML = html;
+    } catch (err) {
+      analyticsContent.textContent = err.message;
+    }
+  }
+
+  function escapeHtml(s) {
+    const div = document.createElement("div");
+    div.textContent = s;
+    return div.innerHTML;
+  }
+
+  async function renderAuditLog() {
+    try {
+      const { events } = await fetchJson("/api/v1/admin/audit-log?limit=50");
+      auditLogBody.innerHTML = "";
+      for (const evt of events) {
+        const { ts, event, ...rest } = evt;
+        const tr = document.createElement("tr");
+        const timeTd = document.createElement("td");
+        timeTd.textContent = new Date(ts * 1000).toLocaleString();
+        const eventTd = document.createElement("td");
+        eventTd.textContent = event;
+        const detailsTd = document.createElement("td");
+        detailsTd.textContent = Object.entries(rest).map(([k, v]) => `${k}=${v}`).join(", ");
+        tr.append(timeTd, eventTd, detailsTd);
+        auditLogBody.appendChild(tr);
+      }
+    } catch (err) {
+      auditLogBody.innerHTML = `<tr><td colspan="3">${escapeHtml(err.message)}</td></tr>`;
+    }
+  }
+
+  async function refreshAll() {
+    await Promise.all([renderQueue(), renderProviders(), renderAnalytics(), renderAuditLog()]);
+  }
+
+  async function init() {
+    let me;
+    try {
+      const resp = await fetch("/api/v1/account/me");
+      if (!resp.ok) {
+        gateMessage.style.display = "block";
+        gateMessage.innerHTML = resp.status === 401
+          ? 'Not signed in. <a href="/">Sign in from the main page</a>, then reload this one.'
+          : "Could not check your account.";
+        return;
+      }
+      me = await resp.json();
+    } catch {
+      gateMessage.style.display = "block";
+      gateMessage.textContent = "Could not reach the server.";
+      return;
+    }
+
+    if (!me.is_admin) {
+      gateMessage.style.display = "block";
+      gateMessage.textContent = `Signed in as ${me.email}, but this account isn't an admin.`;
+      return;
+    }
+
+    dashboard.style.display = "block";
+    await refreshAll();
+    setInterval(refreshAll, 15000);
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>

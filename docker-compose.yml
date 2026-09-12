@@ -85,6 +85,15 @@ services:
       # own docstring) -- set it explicitly for anything past local/dev use:
       #   SESSION_SECRET=... docker compose up --build
       SESSION_SECRET: ${SESSION_SECRET:-}
+      # Phase 18 (master directive numbering): Administration &
+      # Observability. Same safe-to-leave-unset shape as ADMIN_EMAILS's
+      # own config.py default (empty tuple for an empty string) -- with
+      # this unset, GET /admin and every /api/v1/admin/* route stay
+      # unreachable (403) for every account, same as a fresh checkout
+      # having no admin at all. Set it to make the given email(s) real
+      # admins the next time they sign up or log in:
+      #   ADMIN_EMAILS=you@example.com docker compose up --build
+      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
     volumes:
       - work_data:/app/work
     ports:
