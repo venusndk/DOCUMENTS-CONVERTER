@@ -32,7 +32,7 @@ from PIL import Image
 from documents_converter.api import config, security
 from documents_converter.api.app import _rate_limiter, app
 
-from conftest import requires_libreoffice, requires_tesseract
+from conftest import requires_libreoffice, requires_redis, requires_tesseract
 
 client = TestClient(app)
 
@@ -319,6 +319,7 @@ def test_get_job_status_404_for_unknown_id():
 
 
 @requires_tesseract
+@requires_redis
 def test_create_job_returns_202_with_a_pollable_status(synthetic_pdf, tesseract_cmd, monkeypatch):
     monkeypatch.setattr(config, "TESSERACT_CMD", tesseract_cmd)
     with open(synthetic_pdf, "rb") as f:
@@ -341,6 +342,7 @@ def test_create_job_returns_202_with_a_pollable_status(synthetic_pdf, tesseract_
 
 
 @requires_tesseract
+@requires_redis
 def test_job_lifecycle_completes_with_correct_result(synthetic_pdf, tesseract_cmd, monkeypatch):
     """Full async round trip: submit, poll until done, download the
     result, and check it against the same expected values already locked
@@ -368,6 +370,7 @@ def test_job_lifecycle_completes_with_correct_result(synthetic_pdf, tesseract_cm
 
 
 @requires_tesseract
+@requires_redis
 def test_get_job_result_409_before_job_completes(synthetic_pdf, tesseract_cmd, monkeypatch):
     """A job that's still running must report 409 (not ready), not the
     file -- checked deterministically with a monkeypatched slow
@@ -483,6 +486,7 @@ def test_convert_defaults_to_xlsx_target_when_omitted():
     assert "Unsupported file type" in resp.json()["detail"]
 
 
+@requires_redis
 def test_job_image_to_pdf_end_to_end():
     """Same conversion, through the async job queue: submit with
     target=pdf, poll to completion, download, verify it's a real PDF."""
@@ -557,6 +561,7 @@ def test_convert_emits_failed_audit_event_on_rejected_upload(caplog):
     assert _audit_events(caplog) == []
 
 
+@requires_redis
 def test_job_emits_created_and_completed_audit_events(caplog):
     with caplog.at_level(logging.INFO, logger="documents_converter.audit"):
         resp = client.post(
@@ -691,6 +696,7 @@ def test_convert_to_searchable_pdf_end_to_end(synthetic_pdf, tesseract_cmd, monk
 # --------------------------------------------------------------------------
 
 
+@requires_redis
 def test_job_status_reports_has_review_false_for_non_ocr_targets():
     resp = client.post(
         "/api/v1/jobs",
@@ -708,6 +714,7 @@ def test_job_status_reports_has_review_false_for_non_ocr_targets():
 
 
 @requires_tesseract
+@requires_redis
 def test_ocr_job_review_lifecycle_and_correction_reaches_the_xlsx(
     synthetic_pdf, tesseract_cmd, monkeypatch
 ):
@@ -763,6 +770,7 @@ def test_ocr_job_review_lifecycle_and_correction_reaches_the_xlsx(
 
 
 @requires_tesseract
+@requires_redis
 def test_review_rejects_a_correction_for_an_unknown_cell(synthetic_pdf, tesseract_cmd, monkeypatch):
     monkeypatch.setattr(config, "TESSERACT_CMD", tesseract_cmd)
     with open(synthetic_pdf, "rb") as f:
@@ -919,6 +927,7 @@ def test_convert_docx_to_pdf_end_to_end(libreoffice_cmd, monkeypatch, tmp_path):
 
 
 @requires_libreoffice
+@requires_redis
 def test_job_html_to_pdf_end_to_end(libreoffice_cmd, monkeypatch, tmp_path):
     from synthetic_office import MARKER_TEXT, build_html
 

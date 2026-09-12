@@ -74,18 +74,41 @@ job-queue variant, since every operation here is a fast, local,
 in-process PyMuPDF call with nothing for that machinery to buy.
 
 Phase 13 (master directive numbering) added POST /api/v1/batch and GET
-/api/v1/batch/{id}[/download] (batch.py): multi-file upload under one
-shared `target`, each file an ordinary job on the same JobStore/
-_run_job/_convert_executor pipeline POST /api/v1/jobs already uses --
+/api/v1/batch/{id}[/download, /resume] (batch.py): multi-file upload
+under one shared `target`, each file an ordinary job on the same
+JobStore/job_queue/rq_tasks pipeline POST /api/v1/jobs already uses --
 batch.py's BatchRecord is deliberately just the list of job ids
 submitted together, not a parallel job-execution system. "Safe
-concurrency" means exactly that reuse: a batch's files share the same
-4-worker executor every other conversion already competes for, so one
-large batch can't starve the rest of the service. A file that fails
-validation is recorded as its own failed job immediately, without
-blocking the rest of the batch from being queued -- individual failure
-reporting, both from the status endpoint's per-file manifest and
-bundled into the downloaded ZIP's manifest.json.
+concurrency" means exactly that reuse: a batch's files compete for the
+same worker capacity every other conversion already shares (originally
+a 4-thread in-process pool; Phase 14 below replaced that transport with
+Redis/RQ without changing this principle), so one large batch can't
+starve the rest of the service. A file that fails validation is
+recorded as its own failed job immediately, without blocking the rest
+of the batch from being queued -- individual failure reporting, both
+from the status endpoint's per-file manifest and bundled into the
+downloaded ZIP's manifest.json.
+
+Phase 14 (master directive numbering) replaced that in-process
+ThreadPoolExecutor with a real, separate job queue: Redis + RQ
+(job_queue.py, rq_tasks.py), with actual worker processes
+(worker_main.py; docker-compose.yml's `worker` service) pulling jobs
+off it instead of the API process running conversions on its own
+threads. Real job lifecycle (queued/processing/completed/failed/
+cancelled), progress events (GET /api/v1/jobs/{id}/events, Server-Sent
+Events reading the RQ job's own `meta`), automatic retry for
+transient/environment failures (rq_tasks.run_conversion_job, never for
+a bad-input failure that would just fail identically again), manual
+retry/resumability (POST /api/v1/jobs/{id}/retry, POST
+/api/v1/batch/{id}/resume -- re-enqueues a stuck/failed/cancelled job
+reusing its already-saved input file, no re-upload needed), and
+cancellation (POST /api/v1/jobs/{id}/cancel, RQ's own stop-job
+mechanism for a job already in flight). The one non-obvious
+consequence of a separate worker process (in Compose, a separate
+container) is that it needs to see the exact same files the API
+process wrote -- config.WORK_DIR_ROOT points both at a shared volume
+instead of each container's own /tmp; see that config value's and
+storage.py's docstrings.
 
 Phase 12 (master directive numbering) added POST /api/v1/pdf/protect,
 /unlock, /redact, /sign, and /verify-signatures (pdf_security.py):
@@ -120,51 +143,32 @@ from pathlib import Path
 from typing import Callable
 
 import openpyxl
+import redis
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from openpyxl.styles import PatternFill
 from PIL import Image as PILImage
+from rq import Retry
+from rq.command import send_stop_job_command
+from rq.exceptions import NoSuchJobError
+from rq.job import Job as RQJob
 
 import fitz
 
-from . import audit, config, security
+from . import audit, config, job_queue, security
 from .auth import require_api_key
 from .batch import Batch, BatchStore
 from .db import check_db_connection
+from .db import run_migrations as _run_migrations
 from .jobs import Job, JobStore
 from .rate_limit import FixedWindowRateLimiter
+from .rq_tasks import run_conversion_job
 from .storage import storage
 from .. import converters  # noqa: F401 -- import for its registration side effect only
 from .. import pdf_security, pdf_utilities
 from ..document_analysis import analyze
 from ..ocr_excel import _is_suspicious, check_tesseract_available
 from ..registry import Capability, registry
-
-
-def _run_migrations() -> None:
-    """
-    Applies any pending Alembic migrations against config.DATABASE_URL at
-    startup, so a fresh checkout (or a fresh container against a fresh
-    database) doesn't need a separate manual `alembic upgrade head` step
-    to become usable -- consistent with this project's running "zero
-    extra setup" bar for local/dev use.
-
-    Idempotent (upgrading an already-current database is a no-op), which
-    matters here since this runs every time the process starts, not just
-    once. For a deployment that runs multiple replicas against the same
-    database, running migrations as an explicit separate release step
-    instead (skip calling this, run `alembic upgrade head` once before
-    rolling out) avoids every replica racing to migrate on boot --
-    tracked as a known simplification for this single-instance-shaped
-    project, not silently assumed away.
-    """
-    from alembic import command
-    from alembic.config import Config as AlembicConfig
-
-    repo_root = Path(__file__).resolve().parents[2]
-    cfg = AlembicConfig(str(repo_root / "alembic.ini"))
-    cfg.set_main_option("script_location", str(repo_root / "migrations"))
-    command.upgrade(cfg, "head")
 
 
 def _check_startup_config() -> None:
@@ -363,38 +367,13 @@ def _validate_and_save_upload(request: Request, file: UploadFile, work_dir: Path
     return input_path, ext
 
 
-_IMAGE_BOMB_CHECK_EXTENSIONS = frozenset(
-    {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}
-)
-
-
-def _check_decompression_bomb(input_path: Path, ext: str) -> None:
-    """Checks the parsed/decompressed size (PDF page count, image pixel
-    dimensions) before the expensive OCR/conversion pipeline runs. Raises
-    security.FileTooLargeError if it's over the configured limit.
-
-    Phase 9 (master directive numbering) added Office documents (.docx/
-    .xlsx/.pptx and their legacy binary equivalents), HTML, and Markdown
-    as acceptable inputs -- none of them get a decompression check here.
-    HTML/Markdown are plain text with nothing to decompress. Office
-    documents (ZIP containers, like every OOXML format) genuinely CAN be
-    zip-bombed, same class of risk as any ZIP-based format -- not
-    covered by a check here yet. Real, disclosed gap, not silently
-    assumed safe: the raw upload size limit (config.MAX_UPLOAD_MB) and
-    the overall conversion timeout (config.CONVERT_TIMEOUT_SECONDS,
-    which every capability's call already runs under) are the only
-    protection today. Dedicated malicious-file/zip-bomb testing for
-    these formats is master directive Phase 19's job (Performance &
-    Security Hardening), not this one's.
-    """
-    if ext == ".pdf":
-        doc = fitz.open(str(input_path))
-        n_pages = len(doc)
-        doc.close()
-        security.check_pdf_page_count(n_pages)
-    elif ext in _IMAGE_BOMB_CHECK_EXTENSIONS:
-        with PILImage.open(input_path) as img:
-            security.check_image_dimensions(*img.size)
+# Phase 14 (master directive numbering) moved the extension set and the
+# actual check into security.py -- rq_tasks.py's worker-executed task
+# needs the exact same check and must not import this module (a worker
+# process has no reason to construct the FastAPI app). Kept as
+# module-level names here since ~20 call sites below already use them.
+_IMAGE_BOMB_CHECK_EXTENSIONS = security.IMAGE_BOMB_CHECK_EXTENSIONS
+_check_decompression_bomb = security.check_decompression_bomb
 
 
 @app.post("/api/v1/analyze", dependencies=[Depends(require_api_key)])
@@ -587,62 +566,49 @@ def convert(request: Request, file: UploadFile, target: str = Form("xlsx")) -> R
     )
 
 
-def _run_job(
-    job: Job, input_path: Path, output_path: Path, ext: str, capability: Capability, request_id: str
-) -> None:
-    """Runs on the shared executor, in the background -- the HTTP request
-    that created this job has already returned by the time this runs."""
-    _job_store.update(job.id, status="processing")
-    start_time = time.monotonic()
+def _enqueue_conversion_job(job_id: str, input_path: Path, ext: str, target: str, request_id: str) -> None:
+    """
+    Submits one job to Redis/RQ (job_queue.py, rq_tasks.run_conversion_job)
+    -- shared by create_job and create_batch, the only two places that
+    ever enqueue a conversion. Phase 14 (master directive numbering)
+    replaced this function's previous in-process
+    ThreadPoolExecutor.submit(_run_job, ...) body with a real,
+    separate-process job queue -- see job_queue.py and rq_tasks.py's own
+    docstrings for the resulting constraints (only plain str/int
+    arguments cross the queue; the Capability itself is re-resolved
+    fresh inside the worker).
 
-    def _failed(reason: str) -> None:
-        audit.log_event(
-            "job_failed",
-            request_id=request_id,
-            job_id=job.id,
-            reason=reason,
-            duration_ms=int((time.monotonic() - start_time) * 1000),
-        )
+    `job_id=job_id` gives the RQ job the exact same id as this
+    project's own JobRecord for it -- one id, not two, so
+    /jobs/{id}/cancel and /jobs/{id}/events can look either up by the
+    same value a caller already has. `retry=Retry(max=...)` is RQ's own
+    automatic-retry mechanism; see rq_tasks.run_conversion_job's
+    docstring for exactly which failures it applies to (never a bad
+    input, since retrying that can't ever produce a different result).
 
+    Raises HTTPException(503) if Redis itself is unreachable, rather
+    than letting a raw connection error surface as a generic 500 --
+    Redis is now a real external dependency the async conversion
+    pipeline can't function without, the same way a missing Tesseract
+    binary already gets its own clear error path elsewhere.
+    """
     try:
-        _check_decompression_bomb(input_path, ext)
-        capability.convert(
-            input_path,
-            output_path,
-            progress=lambda msg: print(f"[{request_id}] {msg}"),
+        job_queue.get_queue().enqueue(
+            run_conversion_job,
+            job_id,
+            str(input_path),
+            ext,
+            target,
+            request_id,
+            job_id=job_id,
+            job_timeout=config.CONVERT_TIMEOUT_SECONDS,
+            retry=Retry(max=config.JOB_MAX_RETRIES, interval=[5, 15]),
         )
-        # A sibling file next to output_path, not something every
-        # capability announces explicitly -- see converters/
-        # ocr_to_excel.py's own note on why. Only OCR->Excel jobs
-        # produce one today; every other capability's jobs get
-        # review_path=None, and the review endpoints below 404 for those.
-        review_path = output_path.parent / f"{output_path.stem}.review.json"
-        _job_store.update(
-            job.id,
-            status="completed",
-            result_path=output_path,
-            review_path=review_path if review_path.exists() else None,
-        )
-        audit.log_event(
-            "job_completed",
-            request_id=request_id,
-            job_id=job.id,
-            duration_ms=int((time.monotonic() - start_time) * 1000),
-        )
-    except security.FileTooLargeError as e:
-        _job_store.update(job.id, status="failed", error=str(e))
-        _failed("file_too_large")
-    except EnvironmentError as e:
-        _job_store.update(job.id, status="failed", error=str(e))
-        _failed("environment_error")
-    except Exception as e:
-        # Same failure philosophy as the sync endpoint: log the real error
-        # server-side, expose only a generic message via the status endpoint.
-        print(f"[{request_id}] job {job.id} failed: {e!r}")
-        _job_store.update(
-            job.id, status="failed", error="Conversion failed. This has been logged for investigation."
-        )
-        _failed("internal_error")
+    except redis.exceptions.RedisError as e:
+        _job_store.update(job_id, status="failed", error="Job queue (Redis) is unavailable.")
+        raise HTTPException(
+            status_code=503, detail="Job queue is temporarily unavailable. Try again shortly."
+        ) from e
 
 
 @app.post("/api/v1/jobs", dependencies=[Depends(require_api_key)], status_code=202)
@@ -656,9 +622,20 @@ def create_job(request: Request, file: UploadFile, target: str = Form("xlsx")) -
     """
     _check_rate_limit(request)
 
-    job = _job_store.create()
+    job = _job_store.create(target=target)
     work_dir = storage.allocate(f"docconv-job-{job.id}-")
     job.work_dir = work_dir
+    # Persisted immediately, not just set on this local `job` object --
+    # see JobRecord.work_dir's own docstring plus _resume_one_job, both
+    # Phase 14 additions (master directive numbering) that were the
+    # first things to actually need this column populated. Previously
+    # it silently stayed NULL forever (found the hard way: a real
+    # /retry request against a job that had genuinely completed 410'd
+    # as "unavailable", tracing back to this line never having run) --
+    # which also meant _cleanup_expired's own `if record.work_dir:
+    # storage.release(...)` never fired for a single job, ever, a
+    # pre-existing resource leak this phase's own testing surfaced.
+    _job_store.update(job.id, work_dir=work_dir)
 
     try:
         input_path, ext = _validate_and_save_upload(request, file, work_dir)
@@ -672,7 +649,6 @@ def create_job(request: Request, file: UploadFile, target: str = Form("xlsx")) -
         storage.release(work_dir)
         raise HTTPException(status_code=413, detail=str(e)) from e
 
-    output_path = work_dir / f"output{capability.output_extension}"
     _job_store.update(
         job.id,
         result_media_type=capability.media_type,
@@ -697,7 +673,7 @@ def create_job(request: Request, file: UploadFile, target: str = Form("xlsx")) -
         auth_enforced=bool(config.API_KEYS),
     )
 
-    _convert_executor.submit(_run_job, job, input_path, output_path, ext, capability, request_id)
+    _enqueue_conversion_job(job.id, input_path, ext, target, request_id)
 
     return {"job_id": job.id, "status": job.status}
 
@@ -731,6 +707,170 @@ def get_job_result(job_id: str) -> Response:
         media_type=job.result_media_type,
         headers={"Content-Disposition": f"attachment; filename={job.result_filename}"},
     )
+
+
+def _fetch_rq_job(job_id: str) -> RQJob | None:
+    """RQ jobs share their id with this project's own JobRecord (see
+    _enqueue_conversion_job's job_id=job_id). None for a job that was
+    never enqueued (failed validation before queuing) or has aged out
+    of Redis -- both normal, not error, conditions for every caller
+    below."""
+    try:
+        return RQJob.fetch(job_id, connection=job_queue.get_redis_connection())
+    except NoSuchJobError:
+        return None
+
+
+@app.post("/api/v1/jobs/{job_id}/cancel", dependencies=[Depends(require_api_key)])
+def cancel_job(job_id: str) -> dict:
+    """
+    Cancels a job that hasn't reached a terminal status yet: a queued
+    job is removed from the queue before any worker picks it up; a
+    processing job's worker is asked to stop via RQ's own
+    send_stop_job_command (best-effort -- if the worker has already
+    moved past a point where it checks for that signal, or has crashed
+    entirely, this project's own JobRecord status is still set to
+    "cancelled" regardless, since that status is this API's actual
+    source of truth for every other endpoint here, not RQ's). A job
+    already completed/failed/cancelled returns 409, not a silent
+    no-op -- a caller should never mistake "too late to cancel" for
+    "cancelled".
+    """
+    job = _job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job.status in ("completed", "failed", "cancelled"):
+        raise HTTPException(status_code=409, detail=f"Job is already '{job.status}'; nothing to cancel.")
+
+    rq_job = _fetch_rq_job(job_id)
+    if rq_job is not None:
+        if job.status == "processing":
+            try:
+                send_stop_job_command(job_queue.get_redis_connection(), job_id)
+            except Exception:
+                pass
+        else:
+            try:
+                rq_job.cancel()
+            except Exception:
+                pass
+    _job_store.update(job_id, status="cancelled", error="Cancelled by request.")
+    audit.log_event("job_cancelled", job_id=job_id)
+    return {"job_id": job_id, "status": "cancelled"}
+
+
+def _resume_one_job(job: Job) -> str:
+    """
+    Re-enqueues one non-completed job, reusing the same input file
+    already sitting in its work_dir -- no re-upload needed. This is
+    what "resumability" actually means for this service: shared by
+    both POST /jobs/{id}/retry (one job) and POST /batch/{id}/resume
+    (every non-completed job in a batch at once), and by both callers'
+    own real-container tests, which kill a worker mid-conversion,
+    confirm the job is left stuck "processing" with no live RQ job
+    behind it, then call this to prove it actually resumes rather than
+    staying stuck forever.
+
+    Returns a short outcome string rather than raising, so a caller
+    iterating many jobs (batch resume) can report a per-job outcome
+    instead of one job's problem aborting the rest:
+    "queued" (re-enqueued), "already_completed", "already_processing"
+    (a live RQ job still owns it), "unavailable" (its work_dir/input
+    file or `target` didn't survive -- e.g. past its retention window),
+    "queue_unavailable" (Redis itself is unreachable right now).
+    """
+    if job.status == "completed":
+        return "already_completed"
+    if job.status == "processing":
+        rq_job = _fetch_rq_job(job.id)
+        # RQ keeps a finished/failed job's record around for a while
+        # after it's done (result_ttl) -- fetching it successfully does
+        # NOT mean a worker is still actively running it. Confirmed the
+        # hard way: an earlier version of this check treated any
+        # fetchable RQ job as "still owned by a live worker" and
+        # refused to resume a job whose worker had already finished (or
+        # crashed) long ago, exactly the stuck case this function
+        # exists to fix.
+        if rq_job is not None and rq_job.get_status() in ("queued", "started", "deferred", "scheduled"):
+            return "already_processing"
+    if job.target is None or job.work_dir is None or not job.work_dir.exists():
+        return "unavailable"
+    input_candidates = list(job.work_dir.glob("input.*"))
+    if not input_candidates:
+        return "unavailable"
+    input_path = input_candidates[0]
+    ext = input_path.suffix
+
+    request_id = uuid.uuid4().hex[:12]
+    _job_store.update(job.id, status="queued", error=None)
+    audit.log_event("job_retry_requested", job_id=job.id, request_id=request_id)
+    try:
+        _enqueue_conversion_job(job.id, input_path, ext, job.target, request_id)
+    except HTTPException:
+        return "queue_unavailable"
+    return "queued"
+
+
+@app.post("/api/v1/jobs/{job_id}/retry", dependencies=[Depends(require_api_key)])
+def retry_job(job_id: str) -> dict:
+    """Manual retry/resume for one job -- see _resume_one_job. Distinct
+    from RQ's own automatic Retry (rq_tasks.py): this is for a job a
+    caller has given up waiting on (stuck, cancelled, or exhausted its
+    automatic retries), not something the queue does by itself."""
+    job = _job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    outcome = _resume_one_job(job)
+    if outcome == "already_completed":
+        raise HTTPException(status_code=409, detail="Job already completed; nothing to retry.")
+    if outcome == "already_processing":
+        raise HTTPException(status_code=409, detail="Job is actively processing.")
+    if outcome == "unavailable":
+        raise HTTPException(
+            status_code=410, detail="This job's input file is no longer available to retry."
+        )
+    if outcome == "queue_unavailable":
+        raise HTTPException(status_code=503, detail="Job queue is temporarily unavailable.")
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/api/v1/jobs/{job_id}/events", dependencies=[Depends(require_api_key)])
+def job_events(job_id: str) -> StreamingResponse:
+    """
+    Server-Sent Events: streams this job's status and progress message
+    (rq_tasks.py's _report_progress, read from the RQ job's own `meta`)
+    as they change, one `data:` line per change, ending the stream once
+    the job reaches a terminal status. SSE, not WebSockets -- this is
+    one-directional (server to caller only) and works over plain HTTP
+    with no separate protocol upgrade, which is all "watch one job's
+    progress in real time" actually needs.
+    """
+
+    def _stream():
+        last_payload = None
+        # A generous but finite cap -- an SSE connection is still a real
+        # open connection holding a worker thread; this ends it well
+        # past any conversion this service's own CONVERT_TIMEOUT_SECONDS
+        # would already have given up on, rather than holding it open
+        # forever for a job id that will never reach a terminal status.
+        deadline = time.monotonic() + config.CONVERT_TIMEOUT_SECONDS + 60
+        while time.monotonic() < deadline:
+            job = _job_store.get(job_id)
+            if job is None:
+                yield f"event: error\ndata: {json.dumps({'error': 'Job not found.'})}\n\n"
+                return
+            rq_job = _fetch_rq_job(job_id)
+            progress = rq_job.get_meta().get("progress") if rq_job is not None else None
+            payload = {"status": job.status, "progress": progress}
+            if payload != last_payload:
+                yield f"data: {json.dumps(payload)}\n\n"
+                last_payload = payload
+            if job.status in ("completed", "failed", "cancelled"):
+                return
+            time.sleep(0.5)
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
 
 
 @app.get("/api/v1/jobs/{job_id}/review", dependencies=[Depends(require_api_key)])
@@ -853,9 +993,9 @@ def _batch_overall_status(manifest: list[dict]) -> str:
     statuses = {entry["status"] for entry in manifest}
     if statuses <= {"completed"}:
         return "completed"
-    if statuses <= {"failed", "expired"}:
+    if statuses <= {"failed", "expired", "cancelled"}:
         return "failed"
-    if statuses <= {"completed", "failed", "expired"}:
+    if statuses <= {"completed", "failed", "expired", "cancelled"}:
         return "completed_with_errors"
     if "processing" in statuses:
         return "processing"
@@ -866,11 +1006,11 @@ def _batch_overall_status(manifest: list[dict]) -> str:
 def create_batch(request: Request, files: list[UploadFile] = File(...), target: str = Form("xlsx")) -> dict:
     """
     Accepts multiple files under one `target`, queuing each as its own
-    ordinary job on the exact same background pipeline POST
-    /api/v1/jobs uses (_run_job, the shared _convert_executor -- see
-    batch.py's module docstring for why that's what "safe concurrency"
-    means for a batch: still capped at the same 4-at-a-time limit every
-    other conversion already shares, not a separate uncapped pool).
+    ordinary job on the exact same Redis/RQ pipeline POST /api/v1/jobs
+    uses (_enqueue_conversion_job -- see batch.py's module docstring
+    for why that's what "safe concurrency" means for a batch: every
+    file competes for the same worker capacity every other conversion
+    already shares, not a separate uncapped pool).
 
     Per-file failure reporting starts immediately, not just at the end:
     a file that fails validation (wrong extension for `target`, bad
@@ -887,9 +1027,10 @@ def create_batch(request: Request, files: list[UploadFile] = File(...), target: 
 
     job_ids = []
     for file in files:
-        job = _job_store.create()
+        job = _job_store.create(target=target)
         work_dir = storage.allocate(f"docconv-job-{job.id}-")
         job.work_dir = work_dir
+        _job_store.update(job.id, work_dir=work_dir)  # see create_job's identical note
         job_ids.append(job.id)
 
         try:
@@ -905,7 +1046,6 @@ def create_batch(request: Request, files: list[UploadFile] = File(...), target: 
             _job_store.update(job.id, status="failed", error=str(e))
             continue
 
-        output_path = work_dir / f"output{capability.output_extension}"
         _job_store.update(
             job.id,
             result_media_type=capability.media_type,
@@ -924,7 +1064,15 @@ def create_batch(request: Request, files: list[UploadFile] = File(...), target: 
             client_ip=_client_ip(request),
             auth_enforced=bool(config.API_KEYS),
         )
-        _convert_executor.submit(_run_job, job, input_path, output_path, ext, capability, request_id)
+        try:
+            _enqueue_conversion_job(job.id, input_path, ext, target, request_id)
+        except HTTPException:
+            # Redis unreachable -- this one file's job is recorded failed
+            # (inside _enqueue_conversion_job) but the rest of the batch's
+            # files still deserve a shot at being queued, same "one bad
+            # file costs that file, not the batch" principle as a
+            # validation failure above.
+            continue
 
     batch = _batch_store.create(target, job_ids)
     audit.log_event(
@@ -997,6 +1145,32 @@ def get_batch_download(batch_id: str) -> Response:
         media_type="application/zip",
         headers={"Content-Disposition": "attachment; filename=batch-results.zip"},
     )
+
+
+@app.post("/api/v1/batch/{batch_id}/resume", dependencies=[Depends(require_api_key)])
+def resume_batch(batch_id: str) -> dict:
+    """
+    Resumability at the batch level: re-enqueues every file in the
+    batch that isn't completed (see _resume_one_job) -- exercised for
+    real against a live docker-compose stack: kill the worker container
+    mid-batch, confirm the still-in-flight files are left "processing"
+    with no live RQ job behind them, restart a worker, call this, and
+    confirm those files complete without any re-upload. Per-file
+    outcomes, not one pass/fail for the whole batch -- a file whose
+    input no longer exists (its retention window expired) is reported
+    as its own "unavailable" outcome, not an error that blocks
+    resuming the rest.
+    """
+    batch = _batch_store.get(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="Batch not found.")
+
+    outcomes = {}
+    for job_id in batch.job_ids:
+        job = _job_store.get(job_id)
+        outcomes[job_id] = "expired" if job is None else _resume_one_job(job)
+    audit.log_event("batch_resume_requested", batch_id=batch_id, outcomes=outcomes)
+    return {"batch_id": batch_id, "outcomes": outcomes}
 
 
 # --------------------------------------------------------------------------

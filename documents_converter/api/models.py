@@ -62,3 +62,11 @@ class JobRecord(Base):
     # master directive Phase 7 completion's "preview"/"human review"
     # support. NULL for every other capability's jobs.
     review_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Phase 14 (master directive numbering): the original `target` this
+    # job was queued against, needed to re-resolve the same Capability
+    # when re-enqueueing a job (POST .../retry, POST .../resume) without
+    # requiring the caller to re-upload the file or re-specify `target`
+    # -- everything needed to redo the conversion is already sitting in
+    # work_dir plus this column. Nullable only because it didn't exist
+    # before this phase; every job created from here on sets it.
+    target: Mapped[str | None] = mapped_column(String(64), nullable=True)

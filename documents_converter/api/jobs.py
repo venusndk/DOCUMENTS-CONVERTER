@@ -30,7 +30,7 @@ from .db import SessionLocal
 from .models import JobRecord
 from .storage import storage
 
-JobStatus = Literal["queued", "processing", "completed", "failed"]
+JobStatus = Literal["queued", "processing", "completed", "failed", "cancelled"]
 
 
 @dataclass
@@ -57,6 +57,10 @@ class Job:
     # None for every other capability's jobs. Master directive Phase 7
     # completion's "preview"/"human review" support.
     review_path: Path | None = None
+    # Phase 14 (master directive numbering): the `target` this job was
+    # queued against -- see JobRecord.target's own docstring for why
+    # retry/resume need it.
+    target: str | None = None
 
     @classmethod
     def _from_record(cls, record: JobRecord) -> Job:
@@ -70,6 +74,7 @@ class Job:
             result_filename=record.result_filename,
             work_dir=Path(record.work_dir) if record.work_dir else None,
             review_path=Path(record.review_path) if record.review_path else None,
+            target=record.target,
         )
 
 
@@ -77,14 +82,14 @@ class JobStore:
     def __init__(self, retention_seconds: float):
         self.retention_seconds = retention_seconds
 
-    def create(self) -> Job:
+    def create(self, target: str | None = None) -> Job:
         self._cleanup_expired()
         job_id = uuid.uuid4().hex
         now = time.time()
         with SessionLocal() as session:
-            session.add(JobRecord(id=job_id, status="queued", created_at=now))
+            session.add(JobRecord(id=job_id, status="queued", created_at=now, target=target))
             session.commit()
-        return Job(id=job_id, status="queued", created_at=now)
+        return Job(id=job_id, status="queued", created_at=now, target=target)
 
     def get(self, job_id: str) -> Job | None:
         with SessionLocal() as session:
@@ -114,7 +119,7 @@ class JobStore:
         with SessionLocal() as session:
             expired = (
                 session.query(JobRecord)
-                .filter(JobRecord.status.in_(["completed", "failed"]))
+                .filter(JobRecord.status.in_(["completed", "failed", "cancelled"]))
                 .filter(JobRecord.created_at < cutoff)
                 .all()
             )

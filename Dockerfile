@@ -46,10 +46,15 @@ COPY migrations/ migrations/
 # /tmp, which appuser can use without owning /app) and, as of Phase 1
 # completion, to ./data/ for the default local SQLite database -- created
 # and chowned here since appuser can't create new directories under /app
-# itself (owned by root, since WORKDIR ran before this point).
+# itself (owned by root, since WORKDIR ran before this point). /app/work
+# is Phase 14's addition (master directive numbering): where
+# config.WORK_DIR_ROOT points when set -- unused (and harmless to leave
+# empty) unless docker-compose.yml's shared `work_data` volume is mounted
+# here, which is what actually lets the separate `worker` container see
+# files the `api` container wrote.
 RUN useradd --create-home --shell /usr/sbin/nologin appuser \
-    && mkdir -p /app/data \
-    && chown appuser:appuser /app/data
+    && mkdir -p /app/data /app/work \
+    && chown appuser:appuser /app/data /app/work
 USER appuser
 
 EXPOSE 8000
@@ -57,6 +62,10 @@ EXPOSE 8000
 # Lets an orchestrator (docker compose, k8s, etc.) detect a wedged
 # container instead of only a crashed one -- hits the same unauthenticated
 # liveness endpoint real monitoring would (see documents_converter/api/app.py).
+# Only meaningful for the `api` service -- docker-compose.yml's `worker`
+# service (same image, different command) has no HTTP server to probe;
+# Compose simply doesn't define a healthcheck for it, so this directive
+# is inert there rather than wrongly failing it.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)" || exit 1
 

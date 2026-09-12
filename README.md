@@ -565,6 +565,118 @@ files with failures silently dropped.
 processing — the same "not ready yet" convention as
 `GET /api/v1/jobs/{id}/result`.
 
+### Job Queue & Real-Time Processing (Phase 14 completion, master directive numbering)
+
+The biggest infrastructure change in this project so far: `/api/v1/jobs`
+and `/api/v1/batch` no longer run conversions on an in-process thread
+pool. They enqueue onto a real **Redis** queue (**RQ**), and a separate
+**worker** process — its own container in `docker-compose.yml` — pulls
+jobs off it and runs them. `docker run` one image is no longer enough
+to demonstrate this for real; `docker compose up --build` brings up
+Postgres, Redis, the API, and the worker together (Postgres, not the
+default local SQLite, for the same reason this project has supported
+both since Phase 1: two separate processes reading/writing the same
+`JobRecord`/`BatchRecord` rows is exactly Postgres's job, not SQLite's,
+once they're in genuinely separate containers rather than threads in
+one process).
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/jobs/{id}/cancel` | Cancels a queued or in-flight job |
+| `POST /api/v1/jobs/{id}/retry` | Manually re-enqueues a stuck/failed/cancelled job, reusing its already-saved input |
+| `GET /api/v1/jobs/{id}/events` | Server-Sent Events: live status + progress as they change |
+| `POST /api/v1/batch/{id}/resume` | Re-enqueues every non-completed file in a batch at once |
+
+**Job lifecycle** gained a fifth status, `cancelled`, alongside the
+existing `queued`/`processing`/`completed`/`failed`.
+
+**Progress events** are Server-Sent Events, not WebSockets — this is
+one-directional (server to caller) and needs no separate protocol
+upgrade, which is all "watch one job's progress in real time" actually
+needs. Progress text comes from the RQ job's own `meta` dict, updated
+by the same `progress` callback every capability already accepts.
+
+**Automatic retry** (RQ's own `Retry`) only ever applies to a
+failure this project's own code can't already tell is permanent —
+never a bad-input failure (wrong format, a decompression-bomb page
+count), which would just fail identically again. Getting this
+distinction to actually work took a real bug fix along the way: the
+first version left a stale "will be retried" error message in place on
+a job that failed once and then succeeded on retry, because the
+success path never cleared it — caught by testing the retry-then-
+succeed sequence for real (not just the eventually-fails case) and
+finding the completed job still reported an error. A second, more
+fundamental one followed: RQ's own automatic retry, given a nonzero
+retry interval, *schedules* the retry rather than re-queueing it
+immediately, and — confirmed by reading RQ's own source after a retry
+sat stuck at "scheduled" forever in testing — nothing ever promotes a
+scheduled job back onto the real queue unless the worker is run with
+`with_scheduler=True`. Both `worker_main.py` and the test suite's own
+background worker (`tests/conftest.py`) run with it enabled for exactly
+this reason.
+
+**Resumability** means a job or batch left stuck mid-conversion (a
+worker that crashed or was killed) can be picked back up without
+re-uploading anything — the same input file already sitting in the
+job's `work_dir` is reused. Verified for real against a live
+`docker compose` stack, not just unit tests: stopping the `worker`
+container mid-queue and confirming a submitted job stays durably
+`queued` in Redis (not lost); restarting the worker and watching it
+pick the backlog straight back up; and, for the "worker died while
+actively running a job" case specifically, forcing a completed job's
+row back to `processing` directly in the real Postgres database (no
+live RQ job behind it any more) and confirming `POST .../retry`
+resumes it correctly. Finding this scenario also surfaced a real,
+pre-existing bug unrelated to Phase 14 itself: `JobRecord.work_dir` was
+being set on the in-memory `Job` object when a job was created but was
+**never actually persisted to the database** — harmless as long as
+nothing ever needed to look it up again later (which nothing did,
+before resumability existed), but it also meant `JobStore`'s own
+expired-job cleanup never once actually deleted a finished job's temp
+directory, a real disk-space leak this phase's testing is what finally
+surfaced. Fixed by persisting `work_dir` immediately in both
+`create_job` and `create_batch`.
+
+**The one thing a separate worker process needs that a single process
+never did**: access to the exact same files the API process wrote.
+`config.WORK_DIR_ROOT`, when set, points every job's scratch directory
+at a shared location instead of each process's own OS temp directory —
+`docker-compose.yml`'s `work_data` volume, mounted at the same path in
+both the `api` and `worker` containers.
+
+**Minimum Redis version: 4.0** (6+ recommended). RQ's own worker
+registration issues a multi-field `HSET` — one field-value pair was all
+`HSET` supported before Redis 4.0, and this project's own dev machine
+actually surfaced the consequence for real: it has a native Windows
+Redis installed, but it's version 3.0.504 (an unofficial, years-old
+port), and every job submitted against it failed permanently with
+`wrong number of arguments for 'hset' command` the moment a worker
+tried to register itself — not a slow degradation, every single job
+stuck at `queued` forever. `documents_converter/api/job_queue.py` also
+forces RESP2 (`protocol=2`) rather than letting redis-py negotiate
+RESP3 via `HELLO`, since that command doesn't exist before Redis 6.0
+either and failed outright (`unknown command 'HELLO'`) against the same
+old server — RESP2 works against both old and new Redis, so this is
+strictly more compatible, not a downgrade for anyone already on a
+modern one. `docker-compose.yml`'s `redis:7-alpine` and CI's service
+container are both comfortably past this floor; a local native install
+needs to be checked against it explicitly (`redis-cli INFO server`),
+since "Redis is installed" alone doesn't mean "is new enough."
+
+**Local dev note:** like Tesseract and LibreOffice before it, tests
+that need a live Redis skip on this project's own dev machine
+(`tests/conftest.py`'s `@requires_redis` — the machine's native Redis
+being too old counts as "not usable" here too) — real verification
+happens in Docker Compose and CI (a `redis:7-alpine` service container,
+added to `.github/workflows/test.yml` for this phase — trivial to
+provision there, unlike Tesseract/LibreOffice, so there was no reason
+to leave these permanently skip-only). Tests that do run against a real
+Redis use an in-process RQ worker thread (`tests/conftest.py`), not a
+separate process — deliberately, so a test's own monkeypatched
+conversion function (used to simulate a slow or flaky conversion) is
+actually visible to the code that executes the job, which a genuinely
+separate worker process could never see.
+
 ## Document analysis (Phase 4 completion)
 
 `documents_converter/document_analysis.py` inspects a PDF or image and
@@ -902,6 +1014,25 @@ docker run -p 8000:8000 -v documents-converter-data:/app/data documents-converte
 docker run -p 8000:8000 -e DATABASE_URL="postgresql+psycopg://user:pass@host:5432/db" documents-converter-api
 ```
 
+A single `docker run` still works for the synchronous `/api/v1/convert`
+endpoint and for exercising most of the API, but `/api/v1/jobs` and
+`/api/v1/batch` need a real Redis and a real worker process behind them
+as of Phase 14 (master directive numbering) — see that phase's own
+section above for what they do. For the real thing:
+
+```powershell
+docker compose up --build
+# port 8000 already taken by something else? ->
+API_PORT=8001 docker compose up --build
+```
+
+Brings up Postgres, Redis, the API, and a worker together — see
+`docker-compose.yml`'s own comments for why Postgres (not the default
+local SQLite) and a shared volume for job scratch directories are both
+load-bearing here, not incidental choices. Scale worker capacity
+independently of the API process with `docker compose up --build
+--scale worker=3`.
+
 ## Continuous integration
 
 `.github/workflows/test.yml` runs the full test suite on every push and
@@ -926,9 +1057,13 @@ Tests run against a synthetic, fabricated fixture generated on the fly
 contain genuine personal data (see the Accuracy & trust report below and
 `docs/PHASE_0_AUDIT.md` risk register). Each test's docstring names the
 specific real bug it guards against — these aren't speculative edge cases,
-they're regressions this project actually hit during development. One
-end-to-end test needs a real Tesseract install and skips automatically if
-it can't find one on `PATH` or at the default Windows install location.
+they're regressions this project actually hit during development. Three
+things this project depends on aren't installed on its own dev machine --
+Tesseract, LibreOffice, and (Phase 14, master directive numbering) Redis
+-- and every test that needs one skips automatically
+(`@requires_tesseract`/`@requires_libreoffice`/`@requires_redis` in
+`tests/conftest.py`) rather than failing; all three run for real in
+Docker/Docker Compose and CI, where they're actually provisioned.
 
 ---
 

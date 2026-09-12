@@ -33,6 +33,8 @@ import tempfile
 from pathlib import Path
 from typing import Protocol
 
+from . import config
+
 
 class StorageBackend(Protocol):
     """Allocates and releases the scratch directory each upload,
@@ -55,7 +57,12 @@ class LocalDiskStorage:
     """The only backend this service currently ships."""
 
     def allocate(self, prefix: str) -> Path:
-        return Path(tempfile.mkdtemp(prefix=prefix))
+        # Phase 14 (master directive numbering): config.WORK_DIR_ROOT,
+        # when set, points this at a shared volume instead of the OS
+        # default temp directory -- see that config value's own
+        # docstring for why a separate worker process/container needs
+        # this to be able to see the same files the API process wrote.
+        return Path(tempfile.mkdtemp(prefix=prefix, dir=config.WORK_DIR_ROOT))
 
     def release(self, path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)

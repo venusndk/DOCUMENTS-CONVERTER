@@ -1,0 +1,88 @@
+# Phase 14 (master directive numbering): Job Queue & Real-Time
+# Processing. The first point in this project where "docker run" one
+# image isn't enough to demonstrate the real thing -- a real job queue
+# needs a real broker (redis) and a real, separate worker process
+# (worker), not just the api container that was sufficient through
+# Phase 13.
+#
+# Two things every other service here depends on, worth stating once:
+# - Postgres, not the default local SQLite: two separate processes
+#   (api, worker) reading/writing the same JobRecord/BatchRecord rows
+#   is exactly the concurrent-multi-process case Postgres is built for
+#   and SQLite's file-locking is not, even in WAL mode, once that file
+#   is reached from two different containers over a shared volume
+#   rather than two threads in one process. This project has supported
+#   both backends since Phase 1 completion -- this is the deployment
+#   shape that was always the real reason for that, not SQLite's.
+# - The `work_data` volume: api and worker are separate containers with
+#   separate filesystems. A job's input/output files have to live
+#   somewhere both containers can actually see -- see config.WORK_DIR_ROOT
+#   and storage.py's docstrings for the full story.
+#
+# Usage:
+#   docker compose up --build
+#   curl http://localhost:8000/health
+#
+# Scale worker capacity independently of the api process:
+#   docker compose up --build --scale worker=3
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: docconv
+      POSTGRES_PASSWORD: docconv
+      POSTGRES_DB: docconv
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docconv"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://docconv:docconv@postgres:5432/docconv
+      REDIS_URL: redis://redis:6379/0
+      WORK_DIR_ROOT: /app/work
+    volumes:
+      - work_data:/app/work
+    ports:
+      # API_PORT lets a host with 8000 already taken by something else
+      # override the published port without editing this file, e.g.
+      #   API_PORT=8001 docker compose up --build
+      - "${API_PORT:-8000}:8000"
+
+  worker:
+    build: .
+    command: ["python", "-m", "documents_converter.api.worker_main"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://docconv:docconv@postgres:5432/docconv
+      REDIS_URL: redis://redis:6379/0
+      WORK_DIR_ROOT: /app/work
+    volumes:
+      - work_data:/app/work
+
+volumes:
+  pg_data:
+  work_data:

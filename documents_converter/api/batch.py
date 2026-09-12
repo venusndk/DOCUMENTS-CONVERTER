@@ -7,17 +7,21 @@ second time now that the pattern (and the database) already exist.
 Deliberately thin: a BatchRecord is just an ordered list of JobRecord
 ids plus the shared `target` they were all queued against. Every file
 in a batch is a completely ordinary Job, created and run through the
-exact same JobStore/_run_job pipeline a single-file POST /api/v1/jobs
-request already uses -- this module adds nothing new for a job to go
-through, only a way to find a group of jobs that were submitted
-together and report on them collectively (documents_converter/api/
-app.py's POST /api/v1/batch and GET /api/v1/batch/{id}[/download]).
-That reuse is also what "safe concurrency" actually means here: batch
-files are submitted to the same bounded _convert_executor every other
-conversion already shares, so a 50-file batch still only ever runs 4
-conversions at once, the same limit a single caller already lives
-under -- not a separate, uncapped pool that would let one batch request
-starve every other job.
+exact same JobStore/job_queue/rq_tasks pipeline a single-file POST
+/api/v1/jobs request already uses -- this module adds nothing new for a
+job to go through, only a way to find a group of jobs that were
+submitted together and report on them collectively (documents_converter/
+api/app.py's POST /api/v1/batch and GET /api/v1/batch/{id}[/download,
+/resume]). That reuse is also what "safe concurrency" actually means
+here: batch files are enqueued onto the exact same Redis queue every
+other conversion already shares (Phase 14, master directive numbering
+-- see job_queue.py; originally a shared in-process thread pool before
+that phase), so a 50-file batch still only ever runs as many
+conversions at once as there are real worker processes consuming that
+queue, the same capacity every other caller already competes for --
+not a separate, uncapped pool that would let one batch request starve
+every other job. Scaling that capacity (running more `worker` replicas)
+scales every caller's throughput together, not just one batch's.
 """
 
 from __future__ import annotations
