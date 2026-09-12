@@ -171,6 +171,7 @@ def _rq_worker_thread():
         return
 
     from documents_converter.api import job_queue
+    from rq.timeouts import TimerDeathPenalty
     from rq.worker import SimpleWorker
 
     # This fixture polls every ~1s for the entire test session, and
@@ -189,20 +190,47 @@ def _rq_worker_thread():
     logging.getLogger("rq.scheduler").setLevel(logging.WARNING)
 
     class _ThreadSafeWorker(SimpleWorker):
-        """SimpleWorker.work() unconditionally installs SIGINT/SIGTERM
-        handlers, which raises ValueError("signal only works in main
-        thread") the moment it's called from anywhere but the main
-        thread -- confirmed the hard way (this fixture's first version
-        crashed on its very first burst, silently leaving every
-        @requires_redis test's job stuck "queued" forever, since a
-        crashed background thread doesn't fail the test that's waiting
-        on it, just hangs it until its own timeout). This test session
-        doesn't need OS-signal-based shutdown for a worker anyway (it's
-        stopped via `stop_event` below, not a signal), so the handler
-        installation is skipped entirely rather than worked around."""
+        """
+        Two separate signal-in-a-background-thread problems, not one --
+        found one at a time, the hard way:
+
+        1. SimpleWorker.work() unconditionally installs SIGINT/SIGTERM
+           handlers, which raises ValueError("signal only works in main
+           thread") the moment it's called from anywhere but the main
+           thread. This fixture's first version crashed on its very
+           first burst call, silently leaving every @requires_redis
+           test's job stuck "queued" forever (a crashed background
+           thread doesn't fail the test waiting on it, just hangs it
+           until its own timeout). Fixed by skipping handler
+           installation entirely -- this session doesn't need
+           OS-signal-based shutdown for a worker anyway; it's stopped
+           via `stop_event` below.
+
+        2. SimpleWorker.death_penalty_class -- the mechanism that
+           enforces a job's own job_timeout -- is `TimerDeathPenalty`
+           (a plain threading.Timer, thread-safe) on Windows, but
+           `UnixSignalDeathPenalty` (SIGALRM-based, main-thread-only) on
+           Linux. This project's own dev machine is Windows, so fix #1
+           above was verified working there -- but CI runs on Linux,
+           where fix #1 alone wasn't enough: EVERY job execution still
+           raised the identical ValueError from inside perform_job's own
+           timeout handling this time, not from work()'s startup path,
+           so every @requires_redis test still failed. Reproduced
+           directly (not guessed at) by running this exact test suite,
+           against a real Redis, inside a from-scratch Linux container
+           replicating CI's own steps -- 21 failed, 225 passed, matching
+           a real CI run exactly, with the actual traceback finally
+           visible instead of hidden behind CI's log truncation and
+           this session's lack of admin/log-download access. Forcing
+           TimerDeathPenalty here makes this worker's behavior the same
+           thread-safe one on both platforms, rather than accidentally
+           depending on which OS happens to be running the tests.
+        """
 
         def _install_signal_handlers(self):
             pass
+
+        death_penalty_class = TimerDeathPenalty
 
     stop_event = threading.Event()
 
