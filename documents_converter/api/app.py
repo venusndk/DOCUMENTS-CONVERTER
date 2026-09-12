@@ -132,6 +132,7 @@ Run locally:
 
 from __future__ import annotations
 
+import base64
 import json
 import time
 import uuid
@@ -166,6 +167,7 @@ from .rq_tasks import run_conversion_job
 from .storage import storage
 from .. import converters  # noqa: F401 -- import for its registration side effect only
 from .. import pdf_security, pdf_utilities
+from .. import document_preview
 from ..document_analysis import analyze
 from ..ocr_excel import _is_suspicious, check_tesseract_available
 from ..registry import Capability, registry
@@ -458,6 +460,74 @@ def analyze_document(request: Request, file: UploadFile) -> dict:
             ],
             "metadata": result.metadata,
             "quality_flags": result.quality_flags,
+        }
+    finally:
+        storage.release(work_dir)
+
+
+@app.post("/api/v1/preview", dependencies=[Depends(require_api_key)])
+def preview_document(request: Request, file: UploadFile, page: int = Form(1)) -> dict:
+    """
+    Phase 15 (master directive numbering): a real, job-independent look
+    at one page of an uploaded document -- its rendered image plus a
+    bounded text preview (native text layer if present, real Tesseract
+    OCR otherwise) -- before committing to a full /convert or /jobs
+    request. Covers PDF preview, OCR preview, and extracted text preview
+    together (documents_converter/document_preview.py); table preview
+    is served by GET /api/v1/jobs/{id}/review instead, once a real job
+    has actually run real table detection -- running that twice, once
+    here and again for the real job, would waste exactly the compute
+    the async job/queue pipeline exists to spare a caller from paying
+    synchronously.
+    """
+    _check_rate_limit(request)
+
+    work_dir = storage.allocate("docconv-preview-")
+    try:
+        input_path, ext = _validate_and_save_upload(request, file, work_dir)
+        if ext != ".pdf" and ext not in _IMAGE_BOMB_CHECK_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot preview '{ext}' -- not a recognized PDF/image extension.",
+            )
+
+        request_id = uuid.uuid4().hex[:12]
+        audit.log_event(
+            "preview_requested",
+            request_id=request_id,
+            ext=ext,
+            page=page,
+            size_bytes=input_path.stat().st_size,
+            client_ip=_client_ip(request),
+            auth_enforced=bool(config.API_KEYS),
+        )
+
+        try:
+            _check_decompression_bomb(input_path, ext)
+            image_bytes = document_preview.render_page_image(input_path, ext, page)
+            text, is_ocr, page_count = document_preview.extract_text_preview(input_path, ext, page)
+        except ValueError as e:
+            audit.log_event("preview_failed", request_id=request_id, reason="invalid_input")
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except security.FileTooLargeError as e:
+            audit.log_event("preview_failed", request_id=request_id, reason="file_too_large")
+            raise HTTPException(status_code=413, detail=str(e)) from e
+        except Exception as e:
+            print(f"[{request_id}] preview failed: {e!r}")
+            audit.log_event("preview_failed", request_id=request_id, reason="internal_error")
+            raise HTTPException(
+                status_code=500, detail="Preview failed. This has been logged for investigation."
+            ) from e
+
+        audit.log_event(
+            "preview_completed", request_id=request_id, page=page, page_count=page_count, is_ocr=is_ocr
+        )
+        return {
+            "page": page,
+            "page_count": page_count,
+            "is_ocr": is_ocr,
+            "text_preview": text,
+            "image_base64": base64.b64encode(image_bytes).decode("ascii"),
         }
     finally:
         storage.release(work_dir)
@@ -895,6 +965,49 @@ def get_job_review(job_id: str) -> dict:
             detail="No review data for this job (only available for OCR-to-Excel conversions).",
         )
     return json.loads(job.review_path.read_text(encoding="utf-8"))
+
+
+def _find_job_input_file(job: Job) -> Path:
+    """Locates the original uploaded file still sitting in a job's
+    work_dir -- same "input.*" convention _validate_and_save_upload
+    always writes to, same glob Phase 14's _resume_one_job already
+    relies on. Raises HTTPException(410) if the job's work_dir (or the
+    file in it) didn't survive -- past its retention window, same as a
+    job too old to retry."""
+    if job.work_dir is None or not job.work_dir.exists():
+        raise HTTPException(
+            status_code=410, detail="This job's original file is no longer available."
+        )
+    candidates = list(job.work_dir.glob("input.*"))
+    if not candidates:
+        raise HTTPException(
+            status_code=410, detail="This job's original file is no longer available."
+        )
+    return candidates[0]
+
+
+@app.get("/api/v1/jobs/{job_id}/preview/pages/{page_number}", dependencies=[Depends(require_api_key)])
+def get_job_page_preview(job_id: str, page_number: int) -> Response:
+    """
+    Phase 15 (master directive numbering): renders one 1-indexed page
+    of the ORIGINAL file behind this job as a PNG -- the visual half of
+    "table preview" and "OCR preview" that GET .../review's editable
+    table data has never had on its own. Every review-JSON table's
+    `sheet_name` already encodes its 1-indexed source page ("Page N -
+    Table M"), so the frontend pairs this endpoint's image with the
+    matching review table using that number directly, without any new
+    field on the review JSON itself.
+    """
+    job = _job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    input_path = _find_job_input_file(job)
+
+    try:
+        image_bytes = document_preview.render_page_image(input_path, input_path.suffix, page_number)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return Response(content=image_bytes, media_type="image/png")
 
 
 @app.post("/api/v1/jobs/{job_id}/review", dependencies=[Depends(require_api_key)])
