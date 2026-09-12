@@ -230,12 +230,105 @@
   }
 
   .footnote { margin-top: 24px; font-size: 0.75rem; color: var(--muted); text-align: center; }
+
+  /* Phase 17 (master directive numbering): accounts, history, saved
+     jobs. A slim bar, not a second card -- this stays a secondary,
+     optional affordance next to the page's actual job (upload/convert
+     stays the primary, always-usable path with no login required). */
+  #account-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 0.85rem;
+    color: var(--muted);
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+  }
+  #account-bar a { color: var(--accent); text-decoration: none; cursor: pointer; }
+  #account-bar a:hover { text-decoration: underline; }
+
+  #auth-panel, #history-panel { display: none; margin-bottom: 24px; }
+  #auth-panel.visible, #history-panel.visible { display: block; }
+  #auth-panel button, #history-panel button {
+    margin-top: 12px;
+    width: auto;
+    padding: 8px 16px;
+    font-size: 0.9rem;
+  }
+  #auth-status { margin-top: 10px; font-size: 0.85rem; }
+  #auth-status.error { color: var(--status-error-text); }
+  #auth-status.success { color: var(--status-success-text); }
+
+  #history-panel h2 { font-size: 1rem; margin: 0 0 12px; }
+  .history-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.85rem;
+  }
+  .history-row:last-child { border-bottom: none; }
+  .history-row .history-target { color: var(--muted); }
+  .history-row .history-time { color: var(--muted); font-size: 0.8rem; flex: 1; }
+  /* Reuses the same semantic status tokens as #status above -- one
+     meaning per color across the whole page, not a second palette. */
+  .history-badge {
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+  .history-badge.completed { background: var(--status-success-surface); color: var(--status-success-text); }
+  .history-badge.failed { background: var(--status-error-surface); color: var(--status-error-text); }
+  .history-badge.cancelled { background: var(--status-neutral-surface); color: var(--status-neutral-text); }
+  .history-badge.queued, .history-badge.processing {
+    background: var(--status-processing-surface); color: var(--status-processing-text);
+  }
+  .history-row button {
+    margin: 0;
+    width: auto;
+    padding: 4px 10px;
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
 </style>
 </head>
 <body>
   <div class="card">
     <h1>Document Converter</h1>
     <p class="subtitle">Upload a file, choose what to convert it to, and download the result.</p>
+
+    <!-- Phase 17 (master directive numbering): accounts are entirely
+         optional -- everything below still works with no account at
+         all, exactly as before this phase. Signing in only adds a
+         personal history of past jobs and the ability to keep one past
+         its normal retention window ("save"). -->
+    <div id="account-bar">
+      <span id="account-status">Not signed in</span>
+      <a id="account-toggle-link">Sign up / Log in</a>
+      <a id="history-toggle-link" style="display:none;">History</a>
+      <a id="logout-link" style="display:none;">Log out</a>
+    </div>
+
+    <div id="auth-panel">
+      <div class="field">
+        <label for="auth-email">Email</label>
+        <input type="text" id="auth-email" autocomplete="email">
+      </div>
+      <div class="field">
+        <label for="auth-password">Password (min. 8 characters)</label>
+        <input type="password" id="auth-password" autocomplete="current-password">
+      </div>
+      <button id="auth-submit-btn" type="button">Log in</button>
+      <p><a id="auth-mode-toggle">Need an account? Sign up instead</a></p>
+      <div id="auth-status"></div>
+    </div>
+
+    <div id="history-panel">
+      <h2>My history</h2>
+      <div id="history-list"></div>
+    </div>
 
     <div id="dropzone">
       <p><strong>Click to choose a file</strong> or drag one here</p>
@@ -330,6 +423,210 @@
     }
   }
   loadCapabilities();
+
+  // --------------------------------------------------------------------
+  // Phase 17 (master directive numbering): accounts, history, saved jobs.
+  // Entirely optional -- every element above (upload/convert/download)
+  // works exactly as it did before this phase with no account at all.
+  // --------------------------------------------------------------------
+  const accountStatusEl = document.getElementById("account-status");
+  const accountToggleLink = document.getElementById("account-toggle-link");
+  const historyToggleLink = document.getElementById("history-toggle-link");
+  const logoutLink = document.getElementById("logout-link");
+  const authPanel = document.getElementById("auth-panel");
+  const authEmailInput = document.getElementById("auth-email");
+  const authPasswordInput = document.getElementById("auth-password");
+  const authSubmitBtn = document.getElementById("auth-submit-btn");
+  const authModeToggle = document.getElementById("auth-mode-toggle");
+  const authStatusEl = document.getElementById("auth-status");
+  const historyPanel = document.getElementById("history-panel");
+  const historyListEl = document.getElementById("history-list");
+
+  let currentAccount = null;
+  let authMode = "login";
+
+  function readCookie(name) {
+    const match = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
+    return match ? decodeURIComponent(match[1]) : null;
+  }
+
+  // The signed double-submit CSRF cookie (accounts.py's own module
+  // docstring) is deliberately readable by same-origin JS -- reading it
+  // and echoing it back as a header on every mutating account/job-
+  // ownership request is exactly the half of that scheme this page is
+  // expected to carry out.
+  function csrfHeaders() {
+    const token = readCookie("csrf_token");
+    return token ? { "X-CSRF-Token": token } : {};
+  }
+
+  function setAuthStatus(kind, message) {
+    authStatusEl.className = kind || "";
+    authStatusEl.textContent = message || "";
+  }
+
+  function updateAccountBar() {
+    if (currentAccount) {
+      accountStatusEl.textContent = `Signed in as ${currentAccount.email}`;
+      accountToggleLink.style.display = "none";
+      historyToggleLink.style.display = "inline";
+      logoutLink.style.display = "inline";
+      authPanel.classList.remove("visible");
+    } else {
+      accountStatusEl.textContent = "Not signed in";
+      accountToggleLink.style.display = "inline";
+      historyToggleLink.style.display = "none";
+      logoutLink.style.display = "none";
+      historyPanel.classList.remove("visible");
+    }
+  }
+
+  async function refreshAccount() {
+    try {
+      const resp = await fetch("/api/v1/account/me", { headers: authHeaders() });
+      currentAccount = resp.ok ? await resp.json() : null;
+    } catch {
+      currentAccount = null;
+    }
+    updateAccountBar();
+  }
+  refreshAccount();
+
+  accountToggleLink.addEventListener("click", (e) => {
+    e.preventDefault();
+    authPanel.classList.toggle("visible");
+  });
+
+  authModeToggle.addEventListener("click", (e) => {
+    e.preventDefault();
+    authMode = authMode === "login" ? "signup" : "login";
+    authSubmitBtn.textContent = authMode === "login" ? "Log in" : "Sign up";
+    authModeToggle.textContent = authMode === "login"
+      ? "Need an account? Sign up instead"
+      : "Already have an account? Log in instead";
+    setAuthStatus(null, "");
+  });
+
+  authSubmitBtn.addEventListener("click", async () => {
+    const email = authEmailInput.value.trim();
+    const password = authPasswordInput.value;
+    if (!email || !password) {
+      setAuthStatus("error", "Email and password are both required.");
+      return;
+    }
+    authSubmitBtn.disabled = true;
+    try {
+      const resp = await fetch(`/api/v1/account/${authMode}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ email, password }),
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(body.detail || `Request failed (${resp.status})`);
+      currentAccount = body;
+      authPasswordInput.value = "";
+      setAuthStatus("success", `Signed in as ${body.email}.`);
+      updateAccountBar();
+    } catch (err) {
+      setAuthStatus("error", err.message || "Something went wrong.");
+    } finally {
+      authSubmitBtn.disabled = false;
+    }
+  });
+
+  logoutLink.addEventListener("click", async (e) => {
+    e.preventDefault();
+    try {
+      await fetch("/api/v1/account/logout", {
+        method: "POST",
+        headers: { ...authHeaders(), ...csrfHeaders() },
+      });
+    } catch {
+      // Best-effort -- clearing local state below is what the UI
+      // actually needs even if the request itself failed.
+    }
+    currentAccount = null;
+    updateAccountBar();
+  });
+
+  const HISTORY_STATUS_LABELS = {
+    queued: "Queued", processing: "Processing", completed: "Completed",
+    failed: "Failed", cancelled: "Cancelled",
+  };
+
+  function formatHistoryTime(unixSeconds) {
+    return new Date(unixSeconds * 1000).toLocaleString();
+  }
+
+  function renderHistory(jobs) {
+    historyListEl.innerHTML = "";
+    if (!jobs.length) {
+      historyListEl.textContent = "No jobs yet.";
+      return;
+    }
+    for (const job of jobs) {
+      const row = document.createElement("div");
+      row.className = "history-row";
+
+      const badge = document.createElement("span");
+      badge.className = `history-badge ${job.status}`;
+      badge.textContent = HISTORY_STATUS_LABELS[job.status] || job.status;
+      row.appendChild(badge);
+
+      const target = document.createElement("span");
+      target.className = "history-target";
+      target.textContent = (job.target || "").toUpperCase();
+      row.appendChild(target);
+
+      const time = document.createElement("span");
+      time.className = "history-time";
+      time.textContent = formatHistoryTime(job.created_at);
+      row.appendChild(time);
+
+      const saveBtn = document.createElement("button");
+      saveBtn.type = "button";
+      saveBtn.textContent = job.saved ? "Unsave" : "Save";
+      saveBtn.addEventListener("click", () => toggleSaved(job.job_id, !job.saved));
+      row.appendChild(saveBtn);
+
+      historyListEl.appendChild(row);
+    }
+  }
+
+  async function loadHistory() {
+    historyListEl.textContent = "Loading…";
+    try {
+      const resp = await fetch("/api/v1/account/history", { headers: authHeaders() });
+      if (!resp.ok) throw new Error("Could not load history.");
+      const { jobs } = await resp.json();
+      renderHistory(jobs);
+    } catch (err) {
+      historyListEl.textContent = err.message || "Could not load history.";
+    }
+  }
+
+  async function toggleSaved(jobId, save) {
+    try {
+      const resp = await fetch(`/api/v1/jobs/${jobId}/${save ? "save" : "unsave"}`, {
+        method: "POST",
+        headers: { ...authHeaders(), ...csrfHeaders() },
+      });
+      if (!resp.ok) throw new Error("Could not update this job.");
+      await loadHistory();
+    } catch (err) {
+      const p = document.createElement("p");
+      p.style.color = "var(--status-error-text)";
+      p.textContent = err.message || "Could not update this job.";
+      historyListEl.appendChild(p);
+    }
+  }
+
+  historyToggleLink.addEventListener("click", (e) => {
+    e.preventDefault();
+    const willShow = !historyPanel.classList.contains("visible");
+    historyPanel.classList.toggle("visible", willShow);
+    if (willShow) loadHistory();
+  });
 
   function extensionOf(filename) {
     const i = filename.lastIndexOf(".");

@@ -41,6 +41,9 @@ class Batch:
     target: str
     job_ids: list[str]
     total: int
+    # Phase 17 (master directive numbering): see BatchRecord.user_id's
+    # own docstring (models.py).
+    user_id: str | None = None
 
     @classmethod
     def _from_record(cls, record: BatchRecord) -> Batch:
@@ -50,6 +53,7 @@ class Batch:
             target=record.target,
             job_ids=record.job_ids.split(",") if record.job_ids else [],
             total=record.total,
+            user_id=record.user_id,
         )
 
 
@@ -62,7 +66,7 @@ class BatchStore:
         # "job not found" for each of its ids.
         self.retention_seconds = retention_seconds
 
-    def create(self, target: str, job_ids: list[str]) -> Batch:
+    def create(self, target: str, job_ids: list[str], user_id: str | None = None) -> Batch:
         self._cleanup_expired()
         batch_id = uuid.uuid4().hex
         now = time.time()
@@ -74,10 +78,13 @@ class BatchStore:
                     target=target,
                     job_ids=",".join(job_ids),
                     total=len(job_ids),
+                    user_id=user_id,
                 )
             )
             session.commit()
-        return Batch(id=batch_id, created_at=now, target=target, job_ids=job_ids, total=len(job_ids))
+        return Batch(
+            id=batch_id, created_at=now, target=target, job_ids=job_ids, total=len(job_ids), user_id=user_id
+        )
 
     def get(self, batch_id: str) -> Batch | None:
         with SessionLocal() as session:
@@ -85,6 +92,17 @@ class BatchStore:
             return Batch._from_record(record) if record is not None else None
 
     def _cleanup_expired(self) -> None:
+        # Known, disclosed limitation (Phase 17, master directive
+        # numbering): unlike JobStore._cleanup_expired, this doesn't
+        # check whether any of a batch's own job_ids were individually
+        # `saved` -- a batch row can expire here while a saved job it
+        # once grouped still exists and is still directly reachable via
+        # GET /api/v1/jobs/{id}. Only the *grouping* (GET
+        # /api/v1/batch/{id}) is lost in that case, not the job or its
+        # result. Left this way rather than joining against every
+        # referenced JobRecord's `saved` flag on every cleanup pass, for
+        # a case this project doesn't yet have a real use case
+        # justifying that complexity for.
         cutoff = time.time() - self.retention_seconds
         with SessionLocal() as session:
             session.query(BatchRecord).filter(BatchRecord.created_at < cutoff).delete()

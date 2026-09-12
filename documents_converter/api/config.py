@@ -10,6 +10,7 @@ enough for this one API to run without hardcoded machine-specific paths.
 from __future__ import annotations
 
 import os
+import secrets
 
 # Full path to the tesseract executable, only needed if it's not already on
 # PATH (mirrors the CLI's --tesseract-cmd). Unset by default.
@@ -159,3 +160,50 @@ AI_MODEL: str = os.environ.get("AI_MODEL", "gemini-3.6-flash")
 # work well -- bounded the same way document_preview.py's own text
 # preview is, for the same reason.
 AI_MAX_TEXT_CHARS: int = int(os.environ.get("AI_MAX_TEXT_CHARS", "20000"))
+
+# Phase 17 (master directive numbering): Authentication & User
+# Workspace. Real accounts (documents_converter/api/accounts.py) --
+# separate from, and additive to, auth.py's existing pre-shared-key
+# access control above: API_KEYS decides *whether a request is let in
+# at all*; this decides *whose workspace a request acts on* (history,
+# preferences, usage, saved jobs). Neither replaces the other -- an
+# unauthenticated or API-key-only caller keeps working exactly as
+# before, with no account attached to its jobs, the same "additive,
+# opt-in" shape as Phase 16's AI features.
+#
+# Server-side session cookies, not a JWT -- a deliberate, user-made
+# choice (this project's own dual audience, a browser page and script/
+# API callers, made either reasonable; a real login UI tipped it toward
+# cookies). A cookie-based session needs real CSRF protection, unlike a
+# bearer token a script attaches by hand -- see accounts.py's own
+# docstring for the signed-double-submit-cookie scheme built for that,
+# keyed by this secret.
+#
+# No real default is safe to ship: an ephemeral, randomly-generated
+# secret is used when this is unset, so local/dev use needs no extra
+# setup (same "fresh checkout works with zero configuration" bar as
+# every other default in this file) -- but it also means every already
+# logged-in browser's CSRF token stops validating the moment this
+# process restarts (the session row itself is still valid; only the
+# HMAC used to check the X-CSRF-Token header changes), forcing a fresh
+# login. `_check_startup_config` warns the same way it already does for
+# an unset API_KEYS in production; a real deployment should set this
+# explicitly so it survives a restart/redeploy.
+SESSION_SECRET: str = os.environ.get("SESSION_SECRET") or secrets.token_hex(32)
+# Lets app.py's startup guard warn specifically about the ephemeral-
+# fallback case above, in production -- SESSION_SECRET itself is always
+# a real string by the time anything reads it, so this is the only way
+# to tell "the caller actually set this" from "this process invented
+# one just now."
+SESSION_SECRET_WAS_SET: bool = bool(os.environ.get("SESSION_SECRET"))
+
+# How long a session stays valid after login, with no sliding renewal
+# on activity -- simpler and more predictable than a "still active
+# resets the clock" scheme, at the cost of a session that's used every
+# day still expiring on a fixed schedule. 14 days by default: long
+# enough that "log in again" isn't an everyday annoyance for this
+# project's own actual usage pattern (an occasional document-conversion
+# session, not a service someone is logged into continuously), short
+# enough that a stolen/forgotten session cookie doesn't stay valid
+# indefinitely.
+SESSION_MAX_AGE_SECONDS: float = float(os.environ.get("SESSION_MAX_AGE_SECONDS", str(14 * 24 * 3600)))

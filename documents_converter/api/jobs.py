@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from sqlalchemy import func
+
 from .db import SessionLocal
 from .models import JobRecord
 from .storage import storage
@@ -61,6 +63,10 @@ class Job:
     # queued against -- see JobRecord.target's own docstring for why
     # retry/resume need it.
     target: str | None = None
+    # Phase 17 (master directive numbering): see JobRecord.user_id's and
+    # .saved's own docstrings (models.py).
+    user_id: str | None = None
+    saved: bool = False
 
     @classmethod
     def _from_record(cls, record: JobRecord) -> Job:
@@ -75,6 +81,8 @@ class Job:
             work_dir=Path(record.work_dir) if record.work_dir else None,
             review_path=Path(record.review_path) if record.review_path else None,
             target=record.target,
+            user_id=record.user_id,
+            saved=record.saved,
         )
 
 
@@ -82,14 +90,16 @@ class JobStore:
     def __init__(self, retention_seconds: float):
         self.retention_seconds = retention_seconds
 
-    def create(self, target: str | None = None) -> Job:
+    def create(self, target: str | None = None, user_id: str | None = None) -> Job:
         self._cleanup_expired()
         job_id = uuid.uuid4().hex
         now = time.time()
         with SessionLocal() as session:
-            session.add(JobRecord(id=job_id, status="queued", created_at=now, target=target))
+            session.add(
+                JobRecord(id=job_id, status="queued", created_at=now, target=target, user_id=user_id)
+            )
             session.commit()
-        return Job(id=job_id, status="queued", created_at=now, target=target)
+        return Job(id=job_id, status="queued", created_at=now, target=target, user_id=user_id)
 
     def get(self, job_id: str) -> Job | None:
         with SessionLocal() as session:
@@ -114,13 +124,21 @@ class JobStore:
         the retention window. Called on every create() rather than run on
         a separate timer thread -- simple, and sufficient for this
         project's actual load pattern (no long idle periods between
-        jobs in practice)."""
+        jobs in practice).
+
+        Phase 17 (master directive numbering) added one exemption:
+        `saved` jobs are never swept here, regardless of age -- see
+        JobRecord.saved's own docstring for why that's a per-job,
+        caller-controlled opt-in rather than "every logged-in user's
+        job lives forever" (which would make storage growth an
+        unbounded, automatic liability of merely being logged in)."""
         cutoff = time.time() - self.retention_seconds
         with SessionLocal() as session:
             expired = (
                 session.query(JobRecord)
                 .filter(JobRecord.status.in_(["completed", "failed", "cancelled"]))
                 .filter(JobRecord.created_at < cutoff)
+                .filter(JobRecord.saved.is_(False))
                 .all()
             )
             for record in expired:
@@ -128,3 +146,58 @@ class JobStore:
                     storage.release(Path(record.work_dir))
                 session.delete(record)
             session.commit()
+
+    def list_for_user(self, user_id: str, limit: int = 200) -> list[Job]:
+        """Phase 17 (master directive numbering): a logged-in user's own
+        job history, newest first -- both saved and unsaved (the `saved`
+        flag only ever affects retention, not visibility). `limit`
+        matches this project's existing "no pagination yet" bar
+        elsewhere (e.g. batch listing) -- capped rather than unbounded,
+        since a very active account's full history has no real use case
+        yet that justifies building real cursor pagination for it."""
+        with SessionLocal() as session:
+            records = (
+                session.query(JobRecord)
+                .filter(JobRecord.user_id == user_id)
+                .order_by(JobRecord.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            return [Job._from_record(r) for r in records]
+
+    def usage_for_user(self, user_id: str) -> dict:
+        """
+        Phase 17 (master directive numbering): GET /api/v1/account/usage's
+        real numbers -- computed live with a real SQL GROUP BY, not a
+        separate running counter that could drift from what actually
+        happened (the same "don't duplicate a source of truth" reasoning
+        document_analysis.py's own docstring gives for its quality
+        flags). Cheap enough for this project's actual scale that a real
+        query beats maintaining a second one just to avoid it.
+        """
+        with SessionLocal() as session:
+            status_counts = dict(
+                session.query(JobRecord.status, func.count(JobRecord.id))
+                .filter(JobRecord.user_id == user_id)
+                .group_by(JobRecord.status)
+                .all()
+            )
+            saved_count = (
+                session.query(func.count(JobRecord.id))
+                .filter(JobRecord.user_id == user_id, JobRecord.saved.is_(True))
+                .scalar()
+            )
+        return {
+            "total_jobs": sum(status_counts.values()),
+            "jobs_by_status": status_counts,
+            "saved_jobs": saved_count or 0,
+        }
+
+    def set_saved(self, job_id: str, saved: bool) -> Job | None:
+        with SessionLocal() as session:
+            record = session.get(JobRecord, job_id)
+            if record is None:
+                return None
+            record.saved = saved
+            session.commit()
+            return Job._from_record(record)
