@@ -115,3 +115,47 @@ AUDIT_LOG_PATH: str | None = os.environ.get("AUDIT_LOG_PATH") or None
 DATABASE_URL: str = os.environ.get(
     "DATABASE_URL", "sqlite:///./data/documents_converter.db"
 )
+
+# Phase 16 (master directive numbering): AI Document Intelligence --
+# vision fallback, structured extraction, summarization, translation,
+# intelligent classification (documents_converter/ai_intelligence.py).
+# Explicitly "optional/configurable" per the directive: unset by
+# default, same as every other optional external dependency in this
+# file, and every /api/v1/ai/* endpoint checks ai_intelligence.
+# is_ai_available() first and returns a clear 503 rather than failing
+# unpredictably deep inside a request.
+#
+# Google Gemini, not Anthropic/Claude -- a deliberate, disclosed
+# departure from this environment's own "default to the latest Claude
+# models" guidance, made for a concrete, real reason: Gemini's free
+# tier needs no billing/credit card at all, while a working Anthropic
+# key with zero credits purchased genuinely cannot make a single
+# request (confirmed directly: a real call against a real, valid
+# Anthropic key failed with "Your credit balance is too low" before
+# any Phase 16 code existed). For a project whose own stated mission is
+# usability without ongoing cost to whoever runs it, that difference
+# decided the provider.
+GEMINI_API_KEY: str | None = os.environ.get("GEMINI_API_KEY") or None
+
+# Real, empirically-confirmed limitation of that free tier, found while
+# verifying this phase: Gemini caps AI_MODEL at 20 requests/DAY per
+# project on the free tier (the API's own 429 response names this
+# explicitly -- quotaId=GenerateRequestsPerDayPerProjectPerModel-
+# FreeTier, quotaValue=20). A real constraint on whoever runs this
+# service with a free key, not just this project's own tests -- worth
+# knowing before relying on these endpoints for real traffic. A paid
+# Gemini plan raises this considerably; this project doesn't require one.
+
+# gemini-2.5-flash -- the obvious first guess -- turned out to already
+# be retired for new accounts by the time this phase was built ("this
+# model is no longer available to new users"); confirmed against the
+# real API, not assumed from a cached model list, and the error message
+# itself named this replacement.
+AI_MODEL: str = os.environ.get("AI_MODEL", "gemini-3.6-flash")
+
+# A caller pasting or forwarding an entire large document as `text` to
+# summarize/translate/classify/extract would otherwise pay for (and
+# wait on) far more tokens than any of these features actually need to
+# work well -- bounded the same way document_preview.py's own text
+# preview is, for the same reason.
+AI_MAX_TEXT_CHARS: int = int(os.environ.get("AI_MAX_TEXT_CHARS", "20000"))

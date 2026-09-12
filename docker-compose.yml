@@ -60,6 +60,20 @@ services:
       DATABASE_URL: postgresql+psycopg://docconv:docconv@postgres:5432/docconv
       REDIS_URL: redis://redis:6379/0
       WORK_DIR_ROOT: /app/work
+      # Phase 16 (master directive numbering): AI Document Intelligence
+      # is opt-in -- unset by default (${VAR:-} passes an empty string,
+      # which config.py's `or None` treats the same as unset), same as
+      # this file never sets API_KEYS. Only the api process needs this:
+      # every /api/v1/ai/* endpoint is synchronous, nothing runs in
+      # `worker`. Deliberately NOT also passing AI_MODEL/AI_MAX_TEXT_CHARS
+      # through this way -- unlike GEMINI_API_KEY, both of those use a
+      # real non-empty default in config.py (os.environ.get(name,
+      # default) with no `or` fallback), so an unset-on-host `${VAR:-}`
+      # would set the container's env var to "" instead of leaving it
+      # absent, silently overriding that default with an empty/invalid
+      # value. Set it on the host shell before `docker compose up`:
+      #   GEMINI_API_KEY=... docker compose up --build
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     volumes:
       - work_data:/app/work
     ports:
