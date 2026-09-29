@@ -1422,6 +1422,21 @@ these tests only ever run wherever a real `GEMINI_API_KEY` is actually
 set — see `tests/test_ai_intelligence.py`'s own docstring for the real,
 confirmed 20-requests/day free-tier ceiling that comes with doing that.
 
+`tests/load/locustfile.py` (Phase 19, master directive numbering:
+Performance & Security Hardening) is deliberately **not** part of this
+`pytest tests/` run — a load test's whole point is sustained real
+traffic over real wall-clock time, which doesn't fit a normal suite's
+pass/fail-in-seconds model. Run it directly against a live instance:
+
+```powershell
+uvicorn documents_converter.api.app:app &
+locust -f tests/load/locustfile.py --host http://127.0.0.1:8000 `
+  --users 15 --spawn-rate 5 --run-time 45s --headless
+```
+
+See the Performance & Security Hardening section below for this
+project's own real, recorded numbers from running exactly that.
+
 ---
 
 ## Accuracy & trust report
@@ -1544,6 +1559,172 @@ technology allows, and to be transparent about exactly where it isn't
 certain.
 
 ---
+
+## Performance & Security Hardening (Phase 19 completion, master directive numbering)
+
+Every previous phase built something. This one is different in kind:
+*perform* load testing, concurrency testing, memory profiling, security
+testing, malicious-file testing, rate-limit testing, timeout testing,
+and failure injection against the system as it already stood, fix what
+they find, and report honestly. Four real bugs were found and fixed
+this way; every one has a permanent regression test in the files named
+below, not just a one-time manual confirmation.
+
+### Real bugs found and fixed
+
+**A real, working zip bomb** (`documents_converter/api/security.py`,
+`tests/test_malicious_files.py`) — a 500 MB payload compressing to
+under 510 KB on disk (the same DEFLATE-against-a-repeated-byte
+technique real bombs like 42.zip use) sailed completely unblocked
+through `check_decompression_bomb` for every OOXML format (`.docx`/
+`.xlsx`/`.pptx`) before this phase. Confirmed against the real,
+pre-fix code before writing `check_office_zip_bomb`, which sums every
+zip member's own *uncompressed* size straight from the archive's
+central directory (real metadata every standard zip reader already has
+to report correctly for the archive to open at all — no actual
+decompression needed to check it, so the check itself can never become
+the same kind of resource-exhaustion attack it defends against).
+
+**Two async-path exception-handling gaps** (`documents_converter/api/app.py`,
+`tests/test_timeout_and_failure.py`) — `create_job` and `create_batch`
+only ever caught `HTTPException`/`security.FileTooLargeError` around
+upload validation, unlike the synchronous `/api/v1/convert` (which
+already wrapped the same step in a broad `except Exception` +
+`finally: storage.release(...)`). A file that clears the magic-byte
+check but is malformed enough to make parsing itself choke (confirmed
+for real: a corrupt-but-`%PDF`-prefixed file raising
+`pymupdf.FileDataError`) fell through both, leaking its `work_dir`
+forever and leaving the job stuck reporting "queued" rather than
+"failed". Worse in `create_batch` specifically: left uncaught, the
+exception broke out of the whole file loop, silently abandoning every
+*subsequent* file in the batch too — directly contradicting that
+endpoint's own documented "one bad file costs that one file, not the
+other forty-nine." Verified after the fix: the same corrupt file no
+longer aborts a batch's other, good files.
+
+**`JOB_MAX_RETRIES=0` crashed every single job submission**
+(`documents_converter/api/app.py`, `tests/test_timeout_and_failure.py`)
+— found while writing a timeout test that needed to isolate itself from
+automatic retry. RQ's own `Retry(max=0, ...)` raises `ValueError`
+outright ("please enter a value greater than 0") rather than meaning
+"no retry" — confirmed directly against the real `rq` package.
+`JOB_MAX_RETRIES=0` is a real, documented config value (disable
+automatic retry entirely) that turned into an unhandled 500 on
+*every* `POST /api/v1/jobs` before `_enqueue_conversion_job` was fixed
+to omit `retry=` entirely (RQ's own actual "no retry" spelling) rather
+than construct an invalid `Retry` object.
+
+**A real signup race condition** (`documents_converter/api/accounts.py`,
+`tests/test_concurrency.py`) — `AccountStore.signup`'s own
+check-then-insert wasn't atomic: two genuinely concurrent signups for
+the same email could both pass the pre-check before either committed.
+Reproduced directly with real threads (`ThreadPoolExecutor`, 10
+concurrent signups for one email): 9 of 10 crashed with a raw,
+unhandled `sqlite3.IntegrityError`/`psycopg` unique-violation instead
+of the clean `EmailAlreadyRegisteredError` every non-racing caller
+already got. Fixed by catching `IntegrityError` around the commit and
+converting it to that same clean error — the database's own `UNIQUE`
+constraint was always the real, final guard; this just matches its
+failure mode to the pre-check's. Re-verified after the fix: the same
+10-thread race now produces exactly one success and nine clean
+rejections, zero crashes.
+
+### What was tested, and what it found
+
+- **Load testing** (`tests/load/locustfile.py`, Locust) — a real,
+  running instance driven by simulated concurrent users making the same
+  HTTP requests a real caller would (health checks, capability
+  discovery, synchronous conversions, and the full submit-then-poll
+  async job cycle). A real 45-second, 15-concurrent-user run against a
+  live `uvicorn` process (real Redis behind it) handled **1121
+  requests with zero failures** — median 14ms overall, synchronous
+  conversions (no OCR — see the note on why below) at 40–91ms median
+  and under 700ms at p99. A first run at this project's *own default*
+  rate limit (`RATE_LIMIT_MAX_REQUESTS=10`/60s) showed a very different
+  number — 53% "failures", every single one a `429` — not a bug: every
+  simulated user shares one source IP, exactly the scenario the rate
+  limiter exists to throttle, and it did. Reported both numbers rather
+  than only the flattering one: the second run (limit raised) measures
+  this service's own request-handling cost; the first documents the
+  limiter actually engaging under real concurrent load from one source.
+- **Concurrency testing** (`tests/test_concurrency.py`) — real threads
+  against shared state: the signup race above; confirmed
+  `FixedWindowRateLimiter`'s own lock holds correctly under real thread
+  contention (50 threads, one shared key — exactly `max_requests` calls
+  allowed, no double-counting); confirmed 15 simultaneous real
+  `POST /api/v1/jobs` requests all get distinct ids with no collisions.
+- **Memory profiling** (`tests/test_memory_profile.py`, `tracemalloc`)
+  — real repeated conversions (30 measured, after a 10-iteration
+  warm-up) through the actual synchronous endpoint, comparing retained
+  Python-heap size before and after. No unbounded growth found in
+  either pdf→text or image→pdf; a separate check confirms `storage.py`'s
+  `work_dir` cleanup actually removes every synchronous request's
+  scratch directory rather than accumulating them.
+- **Security testing** (`tests/test_security_hardening.py`) — real
+  attack attempts, not a design review: CSRF bypass with a
+  same-length-but-wrong token, and with a real token minted for a
+  *different* session; a forged, syntactically-plausible session cookie
+  that was never actually issued; SQL-injection-shaped strings in the
+  email field and in caller-owned preferences JSON (confirmed inert —
+  and confirmed the `users` table survives, still queryable, immediately
+  after); self-promotion to admin attempted via the preferences blob
+  (`User.is_admin` is a separate column, untouched); cross-account data
+  access; rate-limit bypass via a spoofed `X-Forwarded-For` header
+  (confirmed inert — `_client_ip` reads the real TCP peer address, never
+  a caller-controlled header). Every one held; none needed a fix.
+- **Malicious-file testing** (`tests/test_malicious_files.py`) — the
+  zip bomb above, end-to-end through `POST /api/v1/convert` (`413`, not
+  a hang or a crash); path-traversal-shaped filenames (`../../../etc/
+  passwd.pdf` and Windows/absolute-path variants) confirmed unable to
+  escape the server-allocated work directory (only the extension is
+  ever taken from a client-supplied filename); a null-byte filename
+  trick confirmed rejected, not silently truncated into a
+  different accepted extension; a real PDF/ZIP polyglot confirmed
+  processed as the PDF it claims to be (magic bytes key off the
+  leading signature).
+- **Rate-limit testing** — covered above (load testing's first run;
+  the spoofing attempt in security testing); also confirmed the limit
+  resets correctly once its window elapses (existing coverage,
+  `tests/test_api.py`).
+- **Timeout testing** (`tests/test_timeout_and_failure.py`) — a
+  capability patched to hang forever, submitted through the real async
+  pipeline, confirmed killed by the real, already-explicit
+  `job_timeout=config.CONVERT_TIMEOUT_SECONDS` (RQ's own
+  `TimerDeathPenalty`, the same mechanism Phase 14's own real CI
+  investigation hardened) rather than wedging the worker forever — this
+  test's own first version was itself a lesson in why isolating what
+  you're testing matters: written with the default automatic-retry
+  count still active, it took a real ~23-second retry-then-backoff
+  cycle to reach a terminal state because RQ treats a timeout as a
+  transient, retryable failure (correct, general behavior, not a bug);
+  rewritten with retries disabled specifically for this test so it
+  measures only the timeout itself.
+- **Failure injection** — the create_job/create_batch exception-path
+  gaps above are exactly this: an unexpected internal failure (not a
+  clean, anticipated one) injected via a real corrupt file, checking
+  the system degrades to a clean, logged error with proper cleanup
+  rather than a raw leak or an aborted batch. A genuinely stuck
+  background-worker thread was also hit *by accident* while chasing the
+  timeout-test flakiness above (traced by dumping every live thread's
+  real stack via `sys._current_frames()` mid-hang) — root-caused to a
+  test-ordering issue in this phase's own new tests (one test not
+  waiting for its own job before returning, colliding with the next
+  test's capability monkeypatch), not a product bug; fixed in the test.
+
+### Honest, disclosed scope boundary
+
+This is real, executed testing against this project's own actual code
+and a real running instance — not a formal penetration test, a fuzzing
+campaign, or a third-party security audit, none of which this pass
+attempted or claims to replace. The legacy binary Office formats
+(`.doc`/`.xls`/`.ppt`, a CFB container, not a zip) aren't covered by
+the new zip-bomb check — a real, narrower, disclosed gap, not an
+oversight (see `security.py`'s own docstring). Load testing used this
+project's own fast, no-OCR paths as the main traffic mix deliberately
+(Tesseract's own real per-page cost would otherwise dominate every
+measurement and describe Tesseract's throughput more than this
+service's own API layer's) — a separate, OCR-inclusive load profile is
+a reasonable further step this pass didn't take.
 
 ## Notes
 

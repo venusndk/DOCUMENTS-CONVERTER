@@ -1207,6 +1207,18 @@ def _enqueue_conversion_job(job_id: str, input_path: Path, ext: str, target: str
     pipeline can't function without, the same way a missing Tesseract
     binary already gets its own clear error path elsewhere.
     """
+    # Phase 19 (master directive numbering): a real bug this pass
+    # found -- RQ's own Retry(max=...) raises ValueError outright for
+    # max=0 ("please enter a value greater than 0"), rather than
+    # treating it as "no automatic retry". JOB_MAX_RETRIES=0 is a real,
+    # documented, seemingly reasonable configuration (disable automatic
+    # retry entirely) that crashed *every single* job submission with
+    # an unhandled 500 before this branch existed -- reproduced directly
+    # while writing a timeout test that monkeypatched exactly this
+    # value to isolate its own assertion from RQ's separate retry
+    # behavior. Omitting `retry=` entirely is RQ's own actual "no retry"
+    # spelling.
+    retry = Retry(max=config.JOB_MAX_RETRIES, interval=[5, 15]) if config.JOB_MAX_RETRIES > 0 else None
     try:
         job_queue.get_queue().enqueue(
             run_conversion_job,
@@ -1217,7 +1229,7 @@ def _enqueue_conversion_job(job_id: str, input_path: Path, ext: str, target: str
             request_id,
             job_id=job_id,
             job_timeout=config.CONVERT_TIMEOUT_SECONDS,
-            retry=Retry(max=config.JOB_MAX_RETRIES, interval=[5, 15]),
+            retry=retry,
         )
     except redis.exceptions.RedisError as e:
         _job_store.update(job_id, status="failed", error="Job queue (Redis) is unavailable.")
@@ -1266,7 +1278,28 @@ def create_job(request: Request, file: UploadFile, target: str = Form("xlsx")) -
         raise
     except security.FileTooLargeError as e:
         storage.release(work_dir)
+        _job_store.update(job.id, status="failed", error=str(e))
         raise HTTPException(status_code=413, detail=str(e)) from e
+    except Exception as e:
+        # Phase 19 (master directive numbering): a real gap this pass
+        # found -- unlike the synchronous /api/v1/convert (which wraps
+        # this same validation in a broad except Exception + finally),
+        # this path only ever caught HTTPException/FileTooLargeError.
+        # A file that clears matches_magic_bytes but is still malformed
+        # enough to make check_decompression_bomb's own parsing choke
+        # (confirmed for real: a corrupt-but-%PDF-prefixed file raising
+        # pymupdf.FileDataError) fell through both of those, past the
+        # global exception handler as a raw 500 -- leaking work_dir
+        # forever (storage.release never ran) and leaving the job stuck
+        # at "queued" (JobStore.update never ran either), rather than
+        # cleanly "failed". Same "never leak a stack trace" handling the
+        # sync path already had.
+        print(f"[{job.id}] job validation failed unexpectedly: {e!r}")
+        storage.release(work_dir)
+        _job_store.update(job.id, status="failed", error="Validation failed unexpectedly.")
+        raise HTTPException(
+            status_code=500, detail="Validation failed. This has been logged for investigation."
+        ) from e
 
     _job_store.update(
         job.id,
@@ -1746,6 +1779,21 @@ def create_batch(request: Request, files: list[UploadFile] = File(...), target: 
         except security.FileTooLargeError as e:
             storage.release(work_dir)
             _job_store.update(job.id, status="failed", error=str(e))
+            continue
+        except Exception as e:
+            # Phase 19 (master directive numbering): the same real gap
+            # found and fixed in create_job, but with a more severe
+            # consequence here specifically -- left uncaught, this
+            # doesn't just fail one file's job cleanly, it breaks out of
+            # this whole `for file in files:` loop, silently abandoning
+            # every *subsequent* file in the batch too (never even
+            # attempted), directly contradicting this endpoint's own
+            # documented "one bad file costs that one file, not the
+            # other forty-nine." `continue`, not re-raise, is the fix
+            # that actually matters here.
+            print(f"[{job.id}] batch file validation failed unexpectedly: {e!r}")
+            storage.release(work_dir)
+            _job_store.update(job.id, status="failed", error="Validation failed unexpectedly.")
             continue
 
         _job_store.update(

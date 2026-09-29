@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from fastapi import Depends, HTTPException, Request, Response
+from sqlalchemy.exc import IntegrityError
 
 from . import config
 from .db import SessionLocal
@@ -151,7 +152,22 @@ class AccountStore:
                 is_admin=email in config.ADMIN_EMAILS,
             )
             session.add(record)
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError as e:
+                # Phase 19 (master directive numbering): a real,
+                # confirmed race -- the check above and this commit
+                # aren't atomic, so two concurrent signups for the same
+                # email can both pass the check before either commits.
+                # Reproduced directly (10 concurrent signups for one
+                # email: 9 raised a raw sqlite3.IntegrityError instead
+                # of this clean error) before this except clause
+                # existed. The database's own UNIQUE constraint on
+                # User.email is the real, final guard here -- this
+                # just turns its failure into the same clean error the
+                # pre-check above already gives every non-racing caller.
+                session.rollback()
+                raise EmailAlreadyRegisteredError("An account with this email already exists.") from e
             return Account._from_record(record)
 
     def login(self, email: str, password: str) -> Account:
