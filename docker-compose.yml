@@ -26,9 +26,28 @@
 # Scale worker capacity independently of the api process:
 #   docker compose up --build --scale worker=3
 
+# Phase 20 (master directive numbering): Production Release Engineering.
+# `restart: unless-stopped` on every service -- an orchestrator-level
+# recovery from a crashed *container* (a real disaster-recovery concern
+# for anything running unattended), distinct from the HEALTHCHECK-based
+# recovery from a wedged-but-still-running one already in place.
+# "unless-stopped" specifically (not "always") so a deliberate `docker
+# compose stop` stays stopped across a host reboot, rather than being
+# resurrected against the operator's own explicit action.
+#
+# `deploy.resources.limits` on api/worker -- real numbers Compose
+# enforces even outside Swarm mode, not a Swarm-only no-op. Deliberately
+# generous starting points (LibreOffice's own real per-conversion memory
+# use varies a lot by document), not numbers validated against a
+# specific real production workload -- tune these to what your own
+# traffic and documents actually need, the same "don't invent a number
+# this project can't back up" restraint applied to the DPI/timeout
+# defaults elsewhere.
+
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: docconv
       POSTGRES_PASSWORD: docconv
@@ -43,6 +62,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -51,6 +71,12 @@ services:
 
   api:
     build: .
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
     depends_on:
       postgres:
         condition: service_healthy
@@ -104,6 +130,12 @@ services:
 
   worker:
     build: .
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 3g
     command: ["python", "-m", "documents_converter.api.worker_main"]
     depends_on:
       postgres:
