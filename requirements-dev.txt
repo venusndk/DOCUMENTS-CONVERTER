@@ -14,3 +14,6 @@ python-pptx==1.0.2  # .docx/.pptx test fixtures (Phase 9, master directive
                     # numbering). Test-only: LibreOffice does the actual
                     # runtime conversion, these just generate fixtures to
                     # convert. openpyxl (requirements.txt) covers .xlsx.
+locust==2.46.3      # tests/load/locustfile.py (Phase 19, master directive
+                    # numbering: Performance & Security Hardening) -- real
+                    # load testing against a live server, not simulated.
