@@ -1,0 +1,9 @@
+# Phase 20 (master directive numbering): Production Release Engineering.
+# Shell scripts MUST keep LF line endings regardless of a cloning
+# machine's own core.autocrlf setting -- a CRLF-corrupted shebang line
+# ("#!/usr/bin/env bash\r") fails outright on a real Linux host ("bad
+# interpreter: ...bash\r: no such file"), the actual real-world target
+# for scripts/backup_postgres.sh and restore_postgres.sh. This
+# project's own dev machine has core.autocrlf=true (Windows), which
+# would otherwise silently store/checkout these with CRLF.
+*.sh text eol=lf

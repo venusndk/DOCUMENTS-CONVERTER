@@ -80,8 +80,15 @@ tests/
                                       not part of the runtime conversion path)
 docs/
     PHASE_0_AUDIT.md                  current-state audit, capability matrix, phase plan
-.github/workflows/test.yml            CI: runs the test suite on every push/PR
-Dockerfile                            containerizes the API (not the CLI), non-root + healthcheck
+    OPERATIONS.md                     deployment/backups/monitoring/disaster recovery (Phase 20)
+scripts/
+    backup_postgres.sh                 real pg_dump backup (Phase 20)
+    restore_postgres.sh                real pg_restore restore (Phase 20)
+.env.example                          every env var this project reads, one place (Phase 20)
+.github/workflows/test.yml            CI: tests on every push/PR; CD: builds + publishes a
+                                      Docker image to ghcr.io on merge to main (Phase 20)
+Dockerfile                            containerizes the API (not the CLI), non-root + healthcheck,
+                                      base image pinned by digest (Phase 20)
 LICENSE                                MIT (Phase 11)
 ```
 
@@ -1725,6 +1732,53 @@ project's own fast, no-OCR paths as the main traffic mix deliberately
 measurement and describe Tesseract's throughput more than this
 service's own API layer's) — a separate, OCR-inclusive load profile is
 a reasonable further step this pass didn't take.
+
+## Production Release Engineering (Phase 20 completion, master directive numbering)
+
+**`docs/OPERATIONS.md`** is the real operations runbook this phase
+built — deployment, environment configuration, backups, monitoring,
+scaling, disaster recovery, and incident-response basics, all in one
+place. The summary below hits the highlights; that document has the
+real commands and the real, executed verification behind each one.
+
+- **`.env.example`** — every environment variable this project reads,
+  in one place, each with a one-line purpose and a safe example. A
+  fresh checkout still needs none of them; this is for a real
+  deployment deciding what to actually set.
+- **Production Docker hardening** — the base image is now pinned by
+  digest (`python:3.12-slim@sha256:...`), not just a tag that can be
+  silently repointed later; `docker-compose.yml` gained `restart:
+  unless-stopped` on every service and real, Compose-enforced resource
+  limits on `api`/`worker` — confirmed via `docker inspect` against a
+  live stack that these are real limits, not a Swarm-only no-op.
+- **Backups** — `scripts/backup_postgres.sh` / `restore_postgres.sh`,
+  both run for real against a live stack while building this phase: a
+  real account created, backed up, a second account created, then
+  restored from the first backup — the second account was genuinely
+  gone afterward, confirming this is a real replace that round-trips
+  real data, not an untested script.
+- **CI/CD** — `.github/workflows/test.yml` gained a `docker` job
+  (`needs: test`) that builds the real image on every push/PR (real
+  validation that the Dockerfile itself builds, confirmed on this
+  phase's own PR) and pushes it to `ghcr.io/venusndk/documents-converter`
+  — tagged `latest` and the commit SHA — only on an actual merge to
+  `main`. GitHub Container Registry needs no new secret at all (the
+  built-in `GITHUB_TOKEN` already has package-write permission),
+  unlike Docker Hub, which would need credentials this repo doesn't
+  have configured — the one real registry choice this phase made.
+- **Disaster recovery** — `docs/OPERATIONS.md` lays out exactly what's
+  durable (Postgres: accounts, jobs, audit log) versus what isn't and
+  is fine not to be (Redis queue state, `work_data`'s in-flight files)
+  — including the real, disclosed gap that losing either of the latter
+  two needs a manual recovery step today, not an automatic one.
+
+**Honestly disclosed**: the CI job's build-and-validate half has run
+for real in this project's own CI; the actual registry push only fires
+on a real merge to `main`, which happens after this was written, not
+before. No automated failover, point-in-time recovery, or tested
+multi-region deployment exists — genuinely out of scope for what a
+single-instance-shaped project like this one needs today, not an
+oversight.
 
 ## Notes
 

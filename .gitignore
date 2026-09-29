@@ -35,3 +35,17 @@ Thumbs.db
 
 # Local Claude Code session state, not project code
 .claude/
+
+# Phase 20 (master directive numbering): a real .env a deployer creates
+# locally from .env.example -- never committed, since it's real secrets
+# (API_KEYS, SESSION_SECRET, GEMINI_API_KEY, a real DATABASE_URL), unlike
+# .env.example itself (a template with no real values, meant to be
+# committed).
+.env
+.env.*
+!.env.example
+
+# scripts/backup_postgres.sh's default output -- real database dumps,
+# never committed (same reasoning as data/ above: runtime state, not
+# source, and potentially real user data in a real deployment).
+backups/

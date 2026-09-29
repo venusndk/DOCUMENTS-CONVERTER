@@ -1,7 +1,15 @@
 # Runs the HTTP API (documents_converter/api/app.py). See
 # docs/PHASE_0_AUDIT.md Phase 5: Phases 3-4 built an API with nothing to
 # actually deploy it in until now.
-FROM python:3.12-slim
+#
+# Phase 20 (master directive numbering): pinned by digest, not just the
+# `3.12-slim` tag -- a tag can be silently repointed at a new build by
+# its publisher at any time; a digest can't. Real, reproducible builds
+# (the same input always produces the same base layer) is the actual
+# "production Docker" property this buys, not a cosmetic pin. Bump
+# deliberately (`docker pull python:3.12-slim` and copy its new digest)
+# when a real reason exists to move, not silently on every build.
+FROM python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
 
 # opencv-contrib-python needs libGL/libglib even headless on a minimal
 # Linux image -- a common gotcha, not optional here.
